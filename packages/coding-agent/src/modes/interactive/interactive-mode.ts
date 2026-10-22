@@ -76,11 +76,13 @@ import {
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
 import { formatCacheWarmingStatus, formatCacheWarmingUsage } from "../../core/cache-warmer.ts";
+import { COMPACTION_FAILURE_CUSTOM_TYPE, isCompactionFailureEntry } from "../../core/compaction/failure.ts";
 import { findExtensionStackMatches, recordCrash, takeUnnotifiedCrash } from "../../core/crash-log.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
+	EntryRenderer,
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionRunner,
@@ -139,6 +141,7 @@ import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import { renderCompactionFailureEntry } from "./components/compaction-failure-entry.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -293,6 +296,14 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 
 // EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
 // ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
+/**
+ * Renderers of core custom entry types. Core types use the reserved `pi:` prefix, which
+ * extensions cannot register, and are looked up before extension renderers.
+ */
+const CORE_ENTRY_RENDERERS: ReadonlyMap<string, EntryRenderer> = new Map([
+	[COMPACTION_FAILURE_CUSTOM_TYPE, renderCompactionFailureEntry],
+]);
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -539,6 +550,8 @@ export class InteractiveMode {
 
 	// Auto-compaction state
 	private autoCompactionEscapeHandler?: () => void;
+	/** Whether a compaction failure entry was rendered since the last compaction_end. */
+	private compactionFailureEntryRendered = false;
 
 	// Auto-retry state
 	private retryEscapeHandler?: () => void;
@@ -3400,6 +3413,7 @@ export class InteractiveMode {
 
 			case "entry_appended":
 				if (this.entriesRenderedByBoundaryCompaction.delete(event.entry.id)) break;
+				if (isCompactionFailureEntry(event.entry)) this.compactionFailureEntryRendered = true;
 				if (event.entry.type === "custom") {
 					this.addCustomEntryToChat(event.entry);
 					this.ui.requestRender();
@@ -3627,6 +3641,7 @@ export class InteractiveMode {
 				break;
 
 			case "compaction_start": {
+				this.compactionFailureEntryRendered = false;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -3684,7 +3699,8 @@ export class InteractiveMode {
 						});
 					}
 					this.footer.invalidate();
-				} else if (event.errorMessage) {
+				} else if (event.errorMessage && !this.compactionFailureEntryRendered) {
+					// A failure entry appended for this compaction already shows the error durably.
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage);
 					} else {
@@ -3693,6 +3709,7 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
 					}
 				}
+				this.compactionFailureEntryRendered = false;
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
 				break;
@@ -3813,7 +3830,8 @@ export class InteractiveMode {
 	}
 
 	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>): void {
-		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
+		const renderer =
+			CORE_ENTRY_RENDERERS.get(entry.customType) ?? this.session.extensionRunner.getEntryRenderer(entry.customType);
 		if (!renderer) {
 			return;
 		}
