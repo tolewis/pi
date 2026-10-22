@@ -1,6 +1,10 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CompactionModelUnavailableError, SUMMARY_OUTPUT_ALLOWANCE_TOKENS } from "../../src/core/compaction/index.ts";
+import {
+	COMPACTION_FAILURE_CUSTOM_TYPE,
+	CompactionModelUnavailableError,
+	SUMMARY_OUTPUT_ALLOWANCE_TOKENS,
+} from "../../src/core/compaction/index.ts";
 import type { SessionBeforeCompactEvent } from "../../src/core/extensions/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -24,6 +28,23 @@ function seedHistory(harness: Harness, totalTokens = 650): string {
 	}
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 	return recentUserId;
+}
+
+function failureRecords(harness: Harness): unknown[] {
+	return harness.sessionManager
+		.getEntries()
+		.flatMap((entry) =>
+			entry.type === "custom" && entry.customType === COMPACTION_FAILURE_CUSTOM_TYPE ? [entry.data] : [],
+		);
+}
+
+/** The context is unchanged: entries added after `count` are only compaction failure records. */
+function expectOnlyFailureRecordsAfter(harness: Harness, count: number): void {
+	const added = harness.sessionManager.getEntries().slice(count);
+	expect(added.length).toBeGreaterThan(0);
+	for (const entry of added) {
+		expect(entry).toMatchObject({ type: "custom", customType: COMPACTION_FAILURE_CUSTOM_TYPE });
+	}
 }
 
 // Regression coverage for #8133.
@@ -239,7 +260,21 @@ describe("AgentSession compaction model overrides", () => {
 			expect(error).toBeInstanceOf(CompactionModelUnavailableError);
 			expect((error as CompactionModelUnavailableError).code).toBe("compaction_model_unavailable");
 			expect((error as Error).message).toMatch(/^Compaction model faux\/missing-model is not available: /);
+			expect(failureRecords(harness)).toEqual([
+				expect.objectContaining({
+					trigger: "manual",
+					outcome: "error",
+					reason: "compaction_model_unavailable",
+					model: "faux/missing-model",
+				}),
+			]);
+			expectOnlyFailureRecordsAfter(harness, entriesBefore);
+			expect(requests).toEqual([]);
+		});
 
+		it("records a missing configured model on automatic compaction", async () => {
+			const { harness, requests } = await compactWith({ model: "missing-model" }, "medium");
+			const entriesBefore = harness.sessionManager.getEntries().length;
 			const sessionInternals = harness.session as unknown as {
 				_runAutoCompaction(reason: "threshold", willRetry: boolean): Promise<boolean>;
 			};
@@ -247,7 +282,14 @@ describe("AgentSession compaction model overrides", () => {
 			expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBe(
 				"Auto-compaction failed: Compaction model faux/missing-model is not available: not found in the model registry. Check compaction.provider and compaction.model in your settings.",
 			);
-			expect(harness.sessionManager.getEntries()).toHaveLength(entriesBefore);
+			expect(failureRecords(harness)).toHaveLength(1);
+			expect(failureRecords(harness)[0]).toMatchObject({
+				trigger: "threshold",
+				outcome: "error",
+				reason: "compaction_model_unavailable",
+				model: "faux/missing-model",
+			});
+			expectOnlyFailureRecordsAfter(harness, entriesBefore);
 			expect(requests).toEqual([]);
 			expect(harness.getPendingResponseCount()).toBe(1);
 		});
@@ -262,14 +304,12 @@ describe("AgentSession compaction model overrides", () => {
 			await expect(harness.session.compact()).rejects.toThrow(
 				/^Compaction model faux\/faux-summary is not available: /,
 			);
-			expect(harness.sessionManager.getEntries()).toHaveLength(entriesBefore);
+			expectOnlyFailureRecordsAfter(harness, entriesBefore);
 			expect(requests).toEqual([]);
 		});
 	});
 
 	describe("compaction model window-fit guard", () => {
-		type FallbackRecorder = { _recordCompactionModelWindowFallback(data: unknown): void };
-
 		async function setup(summaryWindow: number) {
 			const harness = await createHarness({
 				models: [
@@ -287,19 +327,15 @@ describe("AgentSession compaction model overrides", () => {
 					return fauxAssistantMessage("summary");
 				},
 			]);
-			const record = vi.spyOn(
-				harness.session as unknown as FallbackRecorder,
-				"_recordCompactionModelWindowFallback",
-			);
-			return { harness, requests, record };
+			return { harness, requests, records: () => failureRecords(harness) };
 		}
 
 		it("runs the session model and records a fallback when the input does not fit", async () => {
-			const { harness, requests, record } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS);
+			const { harness, requests, records } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS);
 			const result = await harness.session.compact();
 			expect(requests).toEqual(["faux-1"]);
-			expect(record).toHaveBeenCalledTimes(1);
-			expect(record.mock.calls[0]?.[0]).toMatchObject({
+			expect(records()).toHaveLength(1);
+			expect(records()[0]).toMatchObject({
 				trigger: "manual",
 				outcome: "fallback",
 				reason: "compaction_model_window",
@@ -313,20 +349,25 @@ describe("AgentSession compaction model overrides", () => {
 		});
 
 		it("uses the compaction model and records nothing when the input fits", async () => {
-			const { harness, requests, record } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS + 4096);
+			const { harness, requests, records } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS + 4096);
 			await harness.session.compact();
 			expect(requests).toEqual(["faux-small"]);
-			expect(record).not.toHaveBeenCalled();
+			expect(records()).toEqual([]);
 		});
 
 		it("applies the guard on threshold compaction", async () => {
-			const { harness, requests, record } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS);
+			const { harness, requests, records } = await setup(SUMMARY_OUTPUT_ALLOWANCE_TOKENS);
 			const sessionInternals = harness.session as unknown as {
 				_runAutoCompaction(reason: "threshold", willRetry: boolean): Promise<boolean>;
 			};
 			await sessionInternals._runAutoCompaction("threshold", false);
 			expect(requests).toEqual(["faux-1"]);
-			expect(record.mock.calls[0]?.[0]).toMatchObject({ trigger: "threshold", outcome: "fallback" });
+			expect(records()).toHaveLength(1);
+			expect(records()[0]).toMatchObject({
+				trigger: "threshold",
+				outcome: "fallback",
+				reason: "compaction_model_window",
+			});
 			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 		});
 	});

@@ -2878,7 +2878,7 @@ export class AgentSession {
 			const window = compactionModel.contextWindow;
 			if (window > 0 && inputTokens + SUMMARY_OUTPUT_ALLOWANCE_TOKENS > window) {
 				summaryConfig = this._getSummarizationModel({ thinkingLevel: settings.thinkingLevel }, model, "compaction");
-				this._recordCompactionModelWindowFallback({
+				this._recordCompactionFailure({
 					trigger: reason,
 					outcome: "fallback",
 					reason: "compaction_model_window",
@@ -2904,23 +2904,6 @@ export class AgentSession {
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
 		);
-	}
-
-	/**
-	 * Local hook for the C5 window-fit fallback record. Branch c1-c3 owns `_recordCompactionFailure`;
-	 * until that merge, this keeps the record shape and the single call site. TODO(c1 merge): call
-	 * `this._recordCompactionFailure(data)` here.
-	 */
-	private _recordCompactionModelWindowFallback(data: {
-		trigger: "manual" | "threshold" | "overflow";
-		outcome: "fallback";
-		reason: "compaction_model_window";
-		model: string;
-		contextWindow: number;
-		tokensBefore: number;
-		errorMessage: string;
-	}): void {
-		void data;
 	}
 
 	/**
