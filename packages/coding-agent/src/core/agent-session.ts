@@ -84,6 +84,7 @@ import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
 	type AgentActivityOutcome,
 	type BoundaryContextPreview,
+	type CompactionEntryDraft,
 	type ContextUsage,
 	type ExecuteToolOptions,
 	type ExtensionCommandContextActions,
@@ -376,6 +377,9 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // ============================================================================
 // AgentSession Class
 // ============================================================================
+
+/** Placeholder id used to validate a self-retaining (null) compaction draft. */
+const SELF_RETAINING_DRAFT_ID = "<self>";
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -876,7 +880,7 @@ export class AgentSession {
 			},
 			(entries) => this._buildBoundaryContext(entries, "turn_end"),
 		);
-		this._commitBoundaryDrafts(boundary.entries);
+		this._commitBoundaryDrafts(boundary.entries, "turn_end");
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
 			this._reportInvalidBoundaryContinuation("turn_end");
 			return false;
@@ -944,9 +948,21 @@ export class AgentSession {
 		this.agent.state.messages = projection.messages;
 	}
 
-	private _applyBoundaryDrafts(manager: SessionManager, drafts: SessionBoundaryDraft[]): SessionEntry[] {
+	private _applyBoundaryDrafts(
+		manager: SessionManager,
+		drafts: SessionBoundaryDraft[],
+		boundary: "turn_end" | "agent_before_settle" | undefined,
+	): SessionEntry[] {
 		const appended: SessionEntry[] = [];
 		for (const draft of drafts) {
+			if (draft.type === "compaction") {
+				const errorMessage = this._validateCompactionDraft(manager, draft);
+				if (errorMessage) {
+					// Drop only this draft; the other drafts still apply. There is no fallback compaction here.
+					if (boundary) this._reportInvalidExtensionCompaction("extension", errorMessage, undefined, boundary);
+					continue;
+				}
+			}
 			let entryId: string;
 			switch (draft.type) {
 				case "custom":
@@ -985,11 +1001,27 @@ export class AgentSession {
 		return appended;
 	}
 
+	/** Returns an error message when a compaction draft must not be appended. */
+	private _validateCompactionDraft(manager: SessionManager, draft: CompactionEntryDraft): string | undefined {
+		const branchIds = new Set(manager.getBranch().map((entry) => entry.id));
+		// appendCompaction() maps null to the new entry's own id, so null is valid by construction.
+		if (draft.firstKeptEntryId === null) branchIds.add(SELF_RETAINING_DRAFT_ID);
+		const validation = validateCompactionResult(
+			{
+				summary: draft.summary,
+				firstKeptEntryId: draft.firstKeptEntryId ?? SELF_RETAINING_DRAFT_ID,
+				tokensBefore: 0,
+			},
+			branchIds,
+		);
+		return validation.ok ? undefined : validation.errorMessage;
+	}
+
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
-		this._applyBoundaryDrafts(manager, drafts);
+		this._applyBoundaryDrafts(manager, drafts, undefined);
 		return manager;
 	}
 
@@ -1022,8 +1054,8 @@ export class AgentSession {
 		};
 	}
 
-	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
-		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
+	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[], boundary: "turn_end" | "agent_before_settle"): void {
+		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts, boundary);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
 	}
@@ -2024,7 +2056,7 @@ export class AgentSession {
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
 			);
-			this._commitBoundaryDrafts(result.entries);
+			this._commitBoundaryDrafts(result.entries, "agent_before_settle");
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;
@@ -2811,13 +2843,14 @@ export class AgentSession {
 	 * throwing handler: report it, then the caller runs the default compaction.
 	 */
 	private _reportInvalidExtensionCompaction(
-		_trigger: "manual" | "threshold" | "overflow",
+		_trigger: "manual" | "threshold" | "overflow" | "extension",
 		errorMessage: string,
-		_tokensBefore: number,
+		_tokensBefore: number | undefined,
+		event: "session_before_compact" | "turn_end" | "agent_before_settle" = "session_before_compact",
 	): void {
 		this._extensionRunner.emitError({
 			extensionPath: "<compaction>",
-			event: "session_before_compact",
+			event,
 			error: errorMessage,
 		});
 	}

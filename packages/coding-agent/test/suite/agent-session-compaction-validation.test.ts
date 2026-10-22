@@ -153,4 +153,69 @@ describe("AgentSession extension compaction result validation", () => {
 			expectDefaultCompaction(harness, errors, invalid.error);
 		});
 	}
+
+	it("drops a boundary-draft compaction with an off-branch firstKeptEntryId and applies the other drafts", async () => {
+		let handled = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("turn_end", () => {
+						if (handled) return;
+						handled = true;
+						return {
+							entries: [
+								{ type: "custom", customType: "test-before", data: { n: 1 } },
+								{ type: "compaction", summary: "bad handoff", firstKeptEntryId: "not-on-branch" },
+								{ type: "custom", customType: "test-after", data: { n: 2 } },
+							],
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const errors: ExtensionError[] = [];
+		harness.session.extensionRunner.onError((error) => errors.push(error));
+		harness.setResponses([fauxAssistantMessage("answer")]);
+
+		await harness.session.prompt("question");
+
+		const entries = harness.sessionManager.getEntries();
+		expect(entries.filter((entry) => entry.type === "compaction")).toHaveLength(0);
+		const customTypes = entries.flatMap((entry) => (entry.type === "custom" ? [entry.customType] : []));
+		expect(customTypes).toEqual(["test-before", "test-after"]);
+		expect(errors).toEqual([
+			expect.objectContaining({
+				event: "turn_end",
+				error: 'Extension compaction result firstKeptEntryId "not-on-branch" is not on the current branch',
+			}),
+		]);
+		expect(harness.session.messages.map((message) => message.role)).not.toContain("compactionSummary");
+	});
+
+	it("accepts a self-retaining boundary-draft compaction", async () => {
+		let handled = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("turn_end", () => {
+						if (handled) return;
+						handled = true;
+						return { entries: [{ type: "compaction", summary: "handoff", firstKeptEntryId: null }] };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const errors: ExtensionError[] = [];
+		harness.session.extensionRunner.onError((error) => errors.push(error));
+		harness.setResponses([fauxAssistantMessage("answer")]);
+
+		await harness.session.prompt("question");
+
+		const compaction = harness.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+		if (compaction?.type !== "compaction") throw new Error("expected a compaction entry");
+		expect(compaction.firstKeptEntryId).toBe(compaction.id);
+		expect(errors).toEqual([]);
+	});
 });

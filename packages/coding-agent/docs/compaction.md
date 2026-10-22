@@ -340,7 +340,7 @@ Pi validates a custom result before it saves it:
 - `firstKeptEntryId` must be the id of an entry on the current branch.
 - `tokensBefore` must be a finite number that is 0 or more.
 
-If a check fails, Pi does not save the result. It reports an extension error for `session_before_compact` with the reason, and then runs the default compaction, the same as when a handler throws. Pi also rejects a default summary that has no text, for example a reply with only thinking blocks. That compaction fails and saves nothing.
+If a check fails, Pi does not save the result. It reports an extension error for `session_before_compact` with the reason, and then runs the default compaction, the same as when a handler throws. The error shows the path `<compaction>`, not the path of the extension, because Pi combines the handler results before it checks them. Pi also checks `compaction` drafts that `turn_end` and `agent_before_settle` handlers return. A `null` `firstKeptEntryId` is valid there. Pi drops an invalid draft, applies the other drafts, and reports an extension error for that event. There is no default compaction on this path. Pi also rejects a default summary that has no text, for example a reply with only thinking blocks. That compaction fails and saves nothing.
 
 #### Converting Messages to Text
 
