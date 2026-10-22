@@ -31,6 +31,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import type { CompactionTrigger } from "./compaction/failure.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -101,6 +102,19 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 	/** Complete prompt and tool state at this compaction boundary. */
 	systemMessage?: SystemMessage;
+	/** What started the compaction. Absent on entries written before Pi recorded it. */
+	reason?: CompactionTrigger;
+	/**
+	 * Estimated context tokens right after the compaction (chars/4 over the new projection,
+	 * since no provider usage exists yet). Absent on older entries.
+	 */
+	tokensAfter?: number;
+}
+
+/** Optional fields of `appendCompaction()`. */
+export interface AppendCompactionOptions {
+	reason?: CompactionTrigger;
+	tokensAfter?: number;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -1265,6 +1279,7 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		usage?: Usage,
+		options: AppendCompactionOptions = {},
 	): string {
 		const timestamp = new Date().toISOString();
 		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
@@ -1281,6 +1296,8 @@ export class SessionManager {
 			usage,
 			fromHook,
 			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
+			...(options.reason ? { reason: options.reason } : {}),
+			...(options.tokensAfter !== undefined ? { tokensAfter: options.tokensAfter } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

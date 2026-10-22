@@ -180,6 +180,9 @@ interface CompactionEntry<T = unknown> {
   usage?: Usage;       // LLM usage that generated the summary
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
+  systemMessage?: SystemMessage; // prompt and tool state at the compaction boundary
+  reason?: "manual" | "threshold" | "overflow" | "extension"; // what started the compaction
+  tokensAfter?: number; // estimated context right after the compaction (chars/4)
 }
 
 // Default compaction uses this for details (from compaction.ts):
@@ -188,6 +191,8 @@ interface CompactionDetails {
   modifiedFiles: string[];
 }
 ```
+
+`reason` and `tokensAfter` are absent on entries written by older Pi versions. `reason: "extension"` marks a compaction draft from a `turn_end` or `agent_before_settle` handler. `ctx.compact()` records `"manual"`, the same reason its events carry. `tokensAfter` is an estimate, not a provider count.
 
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 

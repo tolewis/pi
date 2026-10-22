@@ -982,6 +982,15 @@ export class AgentSession {
 						draft.details,
 						true,
 						draft.usage,
+						{
+							reason: "extension",
+							tokensAfter: this._estimateTokensAfterCompaction(
+								manager,
+								draft.summary,
+								draft.firstKeptEntryId,
+								tokensBefore,
+							),
+						},
 					);
 					break;
 				}
@@ -990,6 +999,23 @@ export class AgentSession {
 			if (entry) appended.push(entry);
 		}
 		return appended;
+	}
+
+	/**
+	 * Estimate the projected context right after appending a compaction to `manager`, by appending
+	 * it to an in-memory copy of the branch. No provider usage exists yet, so this is chars/4.
+	 */
+	private _estimateTokensAfterCompaction(
+		manager: SessionManager,
+		summary: string,
+		firstKeptEntryId: string | null,
+		tokensBefore: number,
+	): number | undefined {
+		const header = manager.getHeader();
+		if (!header) return undefined;
+		const preview = SessionManager.inMemory(this._cwd, undefined, [header, ...manager.getBranch()]);
+		preview.appendCompaction(summary, firstKeptEntryId, tokensBefore);
+		return estimateProjectedContextTokens(preview.buildSessionProjection(), preview.getBranch()).tokens;
 	}
 
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
@@ -2952,7 +2978,15 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, {
+				reason: "manual",
+				tokensAfter: this._estimateTokensAfterCompaction(
+					this.sessionManager,
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+				),
+			});
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3311,7 +3345,15 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, {
+				reason,
+				tokensAfter: this._estimateTokensAfterCompaction(
+					this.sessionManager,
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+				),
+			});
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
