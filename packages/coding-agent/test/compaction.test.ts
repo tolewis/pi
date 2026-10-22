@@ -1,6 +1,6 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import { createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
+	generateSummaryWithUsage,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
@@ -593,6 +594,62 @@ describe("Large session fixture", () => {
 
 		expect(loaded.messages.length).toBeGreaterThan(100);
 		expect(loaded.model).not.toBeNull();
+	});
+});
+
+describe("empty summary rejection", () => {
+	function replyWith(content: AssistantMessage["content"]): StreamFn {
+		return () => {
+			const stream = createAssistantMessageEventStream();
+			stream.end({ ...createAssistantMessage(""), content, stopReason: "stop" });
+			return stream;
+		};
+	}
+
+	function summarize(streamFn: StreamFn) {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const messages = [createUserMessage("Fix the parser")];
+		return generateSummaryWithUsage(
+			messages,
+			model,
+			undefined,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			streamFn,
+		);
+	}
+
+	it("rejects a thinking-only reply", async () => {
+		const streamFn = replyWith([{ type: "thinking", thinking: "The user wants a summary." }]);
+		await expect(summarize(streamFn)).rejects.toThrow("Summarization returned an empty summary");
+	});
+
+	it("rejects a whitespace-only reply", async () => {
+		const streamFn = replyWith([{ type: "text", text: "  \n\t " }]);
+		await expect(summarize(streamFn)).rejects.toThrow("Summarization returned an empty summary");
+	});
+
+	it("rejects an empty summary before compact() appends file lists", async () => {
+		const entries: SessionEntry[] = [];
+		for (let i = 0; i < 6; i++) {
+			entries.push(
+				createMessageEntry(
+					i % 2 === 0 ? createUserMessage(`request ${i} ${"x".repeat(400)}`) : createAssistantMessage("ok"),
+				),
+			);
+		}
+		const preparation = prepareCompaction(entries, { enabled: true, reserveTokens: 0, keepRecentTokens: 1 })!;
+		expect(preparation).toBeDefined();
+		preparation.fileOps.read.add("src/parser.ts");
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const streamFn = replyWith([{ type: "thinking", thinking: "..." }]);
+		await expect(
+			compact(preparation, model, "test-key", undefined, undefined, undefined, undefined, streamFn),
+		).rejects.toThrow("empty summary");
 	});
 });
 

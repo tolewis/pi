@@ -748,6 +748,10 @@ export async function generateSummaryWithUsage(
 	}
 
 	const textContent = contentText(response.content);
+	// A thinking-only reply has no text. Reject it before the caller appends file lists.
+	if (textContent.trim() === "") {
+		throw new Error("Summarization returned an empty summary");
+	}
 
 	return { text: textContent, usage: response.usage };
 }
@@ -1097,8 +1101,10 @@ async function generateTurnPrefixSummary(
 		throw new Error("Turn prefix summarization attempted to call a tool");
 	}
 
-	return {
-		text: contentText(response.content),
-		usage: response.usage,
-	};
+	const text = contentText(response.content);
+	if (text.trim() === "") {
+		throw new Error("Turn prefix summarization returned an empty summary");
+	}
+
+	return { text, usage: response.usage };
 }
