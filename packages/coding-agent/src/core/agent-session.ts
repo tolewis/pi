@@ -71,6 +71,7 @@ import {
 	type CompactionResult,
 	type CompactionSettings,
 	type CompactionSkipReason,
+	type CompactionTrigger,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
@@ -86,7 +87,6 @@ import {
 	shouldRecordCompactionFailure,
 	validateCompactionResult,
 } from "./compaction/index.ts";
-
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -2883,11 +2883,19 @@ export class AgentSession {
 	 * throwing handler: report it, then the caller runs the default compaction.
 	 */
 	private _reportInvalidExtensionCompaction(
-		_trigger: "manual" | "threshold" | "overflow" | "extension",
+		trigger: CompactionTrigger,
 		errorMessage: string,
-		_tokensBefore: number | undefined,
+		tokensBefore: number | undefined,
 		event: "session_before_compact" | "turn_end" | "agent_before_settle" = "session_before_compact",
 	): void {
+		this._recordCompactionFailure({
+			trigger,
+			outcome: "error",
+			reason: "invalid_extension_result",
+			errorMessage,
+			fromExtension: true,
+			...(tokensBefore === undefined ? {} : { tokensBefore }),
+		});
 		this._extensionRunner.emitError({
 			extensionPath: "<compaction>",
 			event,

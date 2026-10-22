@@ -611,6 +611,16 @@ const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation mes
 
 ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
 
+/** The summarizer returned no text, for example a reply with only thinking blocks. */
+export class EmptySummaryError extends Error {
+	readonly code = "empty_summary";
+
+	constructor(message: string) {
+		super(message);
+		this.name = "EmptySummaryError";
+	}
+}
+
 /**
  * Returns an error message when a summarization response cannot safely be persisted.
  * A length stop contains partial text and must not become a session checkpoint.
@@ -783,7 +793,7 @@ export async function generateSummaryWithUsage(
 	const textContent = contentText(response.content);
 	// A thinking-only reply has no text. Reject it before the caller appends file lists.
 	if (textContent.trim() === "") {
-		throw new Error("Summarization returned an empty summary");
+		throw new EmptySummaryError("Summarization returned an empty summary");
 	}
 
 	return { text: textContent, usage: response.usage };
@@ -1178,7 +1188,7 @@ async function generateTurnPrefixSummary(
 
 	const text = contentText(response.content);
 	if (text.trim() === "") {
-		throw new Error("Turn prefix summarization returned an empty summary");
+		throw new EmptySummaryError("Turn prefix summarization returned an empty summary");
 	}
 
 	return { text, usage: response.usage };

@@ -4,7 +4,11 @@ import {
 	fauxAssistantMessage,
 } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CompactionResult } from "../../src/core/compaction/index.ts";
+import {
+	COMPACTION_FAILURE_CUSTOM_TYPE,
+	type CompactionResult,
+	isCompactionFailureEntry,
+} from "../../src/core/compaction/index.ts";
 import type { ExtensionError, SessionBeforeCompactEvent } from "../../src/core/extensions/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -103,6 +107,10 @@ async function createInvalidResultHarness(
 	return { harness, errors, getStreamCallCount: useSummaryStreamFn(harness) };
 }
 
+function failureRecords(harness: Harness) {
+	return harness.sessionManager.getEntries().flatMap((entry) => (isCompactionFailureEntry(entry) ? [entry] : []));
+}
+
 function expectDefaultCompaction(harness: Harness, errors: ExtensionError[], error: string): void {
 	const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
 	expect(compactionEntries).toHaveLength(1);
@@ -113,6 +121,14 @@ function expectDefaultCompaction(harness: Harness, errors: ExtensionError[], err
 	expect(entry.tokensBefore).toBeGreaterThanOrEqual(0);
 	expect(harness.sessionManager.getEntry(entry.firstKeptEntryId)).toBeDefined();
 	expect(errors).toEqual([expect.objectContaining({ event: "session_before_compact", error })]);
+	expect(failureRecords(harness).map((entry) => entry.data)).toEqual([
+		expect.objectContaining({
+			outcome: "error",
+			reason: "invalid_extension_result",
+			errorMessage: error,
+			fromExtension: true,
+		}),
+	]);
 
 	const roles = harness.session.messages.map((message) => message.role);
 	expect(roles).toContain("compactionSummary");
@@ -138,6 +154,7 @@ describe("AgentSession extension compaction result validation", () => {
 			expect(result.summary).toContain(DEFAULT_SUMMARY);
 			expect(getStreamCallCount()).toBe(1);
 			expectDefaultCompaction(harness, errors, invalid.error);
+			expect(failureRecords(harness)[0]?.data).toMatchObject({ trigger: "manual" });
 		});
 
 		it(`auto-compaction rejects ${invalid.name} and runs the default compaction`, async () => {
@@ -151,6 +168,7 @@ describe("AgentSession extension compaction result validation", () => {
 			expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: false });
 			expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBeUndefined();
 			expectDefaultCompaction(harness, errors, invalid.error);
+			expect(failureRecords(harness)[0]?.data).toMatchObject({ trigger: "threshold" });
 		});
 	}
 
@@ -183,7 +201,7 @@ describe("AgentSession extension compaction result validation", () => {
 		const entries = harness.sessionManager.getEntries();
 		expect(entries.filter((entry) => entry.type === "compaction")).toHaveLength(0);
 		const customTypes = entries.flatMap((entry) => (entry.type === "custom" ? [entry.customType] : []));
-		expect(customTypes).toEqual(["test-before", "test-after"]);
+		expect(customTypes).toEqual(["test-before", COMPACTION_FAILURE_CUSTOM_TYPE, "test-after"]);
 		expect(errors).toEqual([
 			expect.objectContaining({
 				event: "turn_end",
@@ -191,6 +209,15 @@ describe("AgentSession extension compaction result validation", () => {
 			}),
 		]);
 		expect(harness.session.messages.map((message) => message.role)).not.toContain("compactionSummary");
+		expect(failureRecords(harness).map((entry) => entry.data)).toEqual([
+			{
+				trigger: "extension",
+				outcome: "error",
+				reason: "invalid_extension_result",
+				errorMessage: 'Extension compaction result firstKeptEntryId "not-on-branch" is not on the current branch',
+				fromExtension: true,
+			},
+		]);
 	});
 
 	it("accepts a self-retaining boundary-draft compaction", async () => {
@@ -217,5 +244,39 @@ describe("AgentSession extension compaction result validation", () => {
 		if (compaction?.type !== "compaction") throw new Error("expected a compaction entry");
 		expect(compaction.firstKeptEntryId).toBe(compaction.id);
 		expect(errors).toEqual([]);
+		expect(failureRecords(harness)).toEqual([]);
+	});
+
+	it("records an empty_summary failure when the summarizer returns only thinking", async () => {
+		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = (model) => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					...fauxAssistantMessage(""),
+					content: [{ type: "thinking", thinking: "only thinking" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+				};
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+		expect(failureRecords(harness).map((entry) => entry.data)).toEqual([
+			expect.objectContaining({
+				trigger: "threshold",
+				outcome: "error",
+				reason: "empty_summary",
+				errorMessage: "Summarization returned an empty summary",
+			}),
+		]);
 	});
 });
