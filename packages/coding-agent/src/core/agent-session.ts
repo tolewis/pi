@@ -65,19 +65,28 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	COMPACTION_FAILURE_CUSTOM_TYPE,
+	type CompactionFailureData,
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
+	type CompactionSkipReason,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
+	failureModelFromError,
+	failureReasonFromError,
 	generateBranchSummary,
-	prepareCompaction,
+	isCompactionFailureEntry,
+	prepareCompactionOrSkip,
 	shouldCompact,
+	shouldRecordCompactionFailure,
 	validateCompactionResult,
 } from "./compaction/index.ts";
+
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -1087,6 +1096,37 @@ export class AgentSession {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
 			await this._extensionRunner.emit({ type: "session_compact_failed", ...event });
 		}
+	}
+
+	/**
+	 * Append a durable `pi:compaction_failure` custom entry to the session.
+	 * Dedupe: returns false and appends nothing when `shouldRecordCompactionFailure()` finds an
+	 * equal record for the same check cluster (error, cancelled, timeout) or episode (skipped,
+	 * fallback). Call sites keep their own `compaction_end` and `session_compact_failed` events.
+	 */
+	private _recordCompactionFailure(data: CompactionFailureData): boolean {
+		if (!shouldRecordCompactionFailure(this.sessionManager.getBranch(), data)) return false;
+		const entry = this.sessionManager.getEntry(
+			this.sessionManager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, data),
+		);
+		if (entry) this._emit({ type: "entry_appended", entry });
+		return true;
+	}
+
+	/** Model, window, and threshold fields of a failure record for a compaction with `model`. */
+	private _compactionFailureLimits(
+		model: Model<any> | undefined,
+		settings: CompactionSettings,
+	): Pick<CompactionFailureData, "model" | "contextWindow" | "threshold"> {
+		if (!model) return {};
+		const limits: Pick<CompactionFailureData, "model" | "contextWindow" | "threshold"> = {
+			model: `${model.provider}/${model.id}`,
+		};
+		if (model.contextWindow > 0) {
+			limits.contextWindow = model.contextWindow;
+			limits.threshold = model.contextWindow - settings.reserveTokens;
+		}
+		return limits;
 	}
 
 	private _getIdleWaitPromise(): Promise<void> {
@@ -2881,25 +2921,31 @@ export class AgentSession {
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
 		let cancelledByExtension = false;
+		const model = this.model;
+		let settings: CompactionSettings | undefined;
+		let skipReason: CompactionSkipReason | undefined;
+		let tokensBefore: number | undefined;
 
 		try {
-			const model = this.model;
 			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const settings = this.settingsManager.getCompactionSettings(model);
+			settings = this.settingsManager.getCompactionSettings(model);
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
+			const prepared = prepareCompactionOrSkip(pathEntries, settings);
+			if (!("preparation" in prepared)) {
+				skipReason = prepared.skipReason;
+				// Check why we can't compact. Failure records after a compaction do not count.
+				const lastEntry = pathEntries.findLast((entry) => !isCompactionFailureEntry(entry));
 				if (lastEntry?.type === "compaction") {
 					throw new Error("Already compacted");
 				}
 				throw new Error("Nothing to compact (session too small)");
 			}
+			const preparation = prepared.preparation;
+			tokensBefore = preparation.tokensBefore;
 
 			let extensionCompaction: CompactionResult | undefined;
 
@@ -2935,7 +2981,6 @@ export class AgentSession {
 
 			let summary: string;
 			let firstKeptEntryId: string;
-			let tokensBefore: number;
 			let usage: Usage | undefined;
 			let details: unknown;
 
@@ -3008,6 +3053,16 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = this._compactionAbortController.signal.aborted || cancelledByExtension;
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
+			this._recordCompactionFailure({
+				trigger: "manual",
+				outcome: skipReason ? "skipped" : aborted ? "cancelled" : "error",
+				reason: skipReason ?? (aborted ? "cancelled" : failureReasonFromError(error, "summarizer_error")),
+				...(aborted ? {} : { errorMessage: message }),
+				...(tokensBefore !== undefined ? { tokensBefore } : {}),
+				...(settings ? this._compactionFailureLimits(model, settings) : {}),
+				...(failureModelFromError(error) ? { model: failureModelFromError(error) } : {}),
+				...(fromExtension ? { fromExtension } : {}),
+			});
 			this._clearManualCompactionState();
 			this._emit({
 				type: "compaction_end",
@@ -3138,6 +3193,13 @@ export class AgentSession {
 				const errorMessage = contextOverflow
 					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
 					: "Truncated response recovery failed after one compact-and-retry attempt.";
+				this._recordCompactionFailure({
+					trigger: "overflow",
+					outcome: "error",
+					reason: "overflow_recovery_exhausted",
+					errorMessage,
+					...this._compactionFailureLimits(this.model, settings),
+				});
 				this._emit({
 					type: "compaction_end",
 					reason: "overflow",
@@ -3219,6 +3281,7 @@ export class AgentSession {
 		let started = false;
 		let fromExtension = false;
 		let cancelledByExtension = false;
+		let preparation: CompactionPreparation | undefined;
 
 		try {
 			if (!model) {
@@ -3226,10 +3289,25 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
+			const prepared = prepareCompactionOrSkip(pathEntries, settings);
+			if (!("preparation" in prepared)) {
+				// Callers only get here over the threshold or after an overflow, so a skip leaves the
+				// context growing toward provider overflow. Record it.
+				this._recordCompactionFailure({
+					trigger: reason,
+					outcome: "skipped",
+					reason: prepared.skipReason,
+					errorMessage:
+						prepared.skipReason === "kept_window_exceeds_threshold"
+							? `keepRecentTokens (${settings.keepRecentTokens}) keeps all context since the last compaction`
+							: "no messages to summarize since the last compaction",
+					tokensBefore: estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), pathEntries)
+						.tokens,
+					...this._compactionFailureLimits(model, settings),
+				});
 				return false;
 			}
+			preparation = prepared.preparation;
 
 			abortController = new AbortController();
 			this._autoCompactionAbortController = abortController;
@@ -3338,6 +3416,16 @@ export class AgentSession {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "compaction failed";
 			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
+			this._recordCompactionFailure({
+				trigger: reason,
+				outcome: aborted ? "cancelled" : "error",
+				reason: aborted ? "cancelled" : failureReasonFromError(error, "summarizer_error"),
+				...(aborted ? {} : { errorMessage: message }),
+				...(preparation ? { tokensBefore: preparation.tokensBefore } : {}),
+				...this._compactionFailureLimits(model, settings),
+				...(failureModelFromError(error) ? { model: failureModelFromError(error) } : {}),
+				...(fromExtension ? { fromExtension } : {}),
+			});
 			if (started) {
 				const errorMessage = aborted
 					? undefined

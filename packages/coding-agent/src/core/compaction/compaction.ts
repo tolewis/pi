@@ -828,14 +828,20 @@ function findProjectedCutPoint(
 	startIndex: number,
 	endIndex: number,
 	keepRecentTokens: number,
-): CutPointResult {
+): CutPointResult & { exceededBudget: boolean; hasCutPoints: boolean } {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
 		const entry = entries[i];
 		if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isCutPointMessage)) cutPoints.push(i);
 	}
 	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+		return {
+			firstKeptEntryIndex: startIndex,
+			turnStartIndex: -1,
+			isSplitTurn: false,
+			exceededBudget: false,
+			hasCutPoints: false,
+		};
 	}
 
 	let accumulatedTokens = 0;
@@ -890,15 +896,48 @@ function findProjectedCutPoint(
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
 		isSplitTurn: !startsTurn && turnStartIndex !== -1,
+		exceededBudget,
+		hasCutPoints: true,
 	};
 }
+
+/** Why `prepareCompaction()` returned undefined. */
+export type CompactionSkipReason = "kept_window_exceeds_threshold" | "nothing_to_summarize";
 
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
+	return prepareCompactionWithCutPoint(pathEntries, settings).preparation;
+}
+
+/**
+ * Same as `prepareCompaction()`, but report why nothing can be compacted.
+ * `kept_window_exceeds_threshold`: the context since the last compaction fits in
+ * `keepRecentTokens`, so the cut keeps everything. `nothing_to_summarize`: any other case, for
+ * example the last entry is a compaction or no message since it can start a kept range.
+ */
+export function prepareCompactionOrSkip(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+): { preparation: CompactionPreparation } | { skipReason: CompactionSkipReason } {
+	const { preparation, cutPoint } = prepareCompactionWithCutPoint(pathEntries, settings);
+	if (preparation) return { preparation };
+	return {
+		skipReason:
+			cutPoint?.hasCutPoints && !cutPoint.exceededBudget ? "kept_window_exceeds_threshold" : "nothing_to_summarize",
+	};
+}
+
+function prepareCompactionWithCutPoint(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+): {
+	preparation?: CompactionPreparation;
+	cutPoint?: CutPointResult & { exceededBudget: boolean; hasCutPoints: boolean };
+} {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
-		return undefined;
+		return {};
 	}
 
 	const projection = buildSessionProjection(pathEntries);
@@ -922,7 +961,7 @@ export function prepareCompaction(
 	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
 	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
-	if (!firstKeptEntry?.id) return undefined;
+	if (!firstKeptEntry?.id) return { cutPoint };
 	const firstKeptEntryId = firstKeptEntry.id;
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
@@ -935,7 +974,7 @@ export function prepareCompaction(
 				.flatMap(getMessagesFromProjectedEntryForCompaction)
 		: [];
 
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return { cutPoint };
 
 	// Extract file operations from edited model-visible messages and the previous compaction.
 	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
@@ -948,14 +987,17 @@ export function prepareCompaction(
 	}
 
 	return {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn: cutPoint.isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		fileOps,
-		settings,
+		cutPoint,
+		preparation: {
+			firstKeptEntryId,
+			messagesToSummarize,
+			turnPrefixMessages,
+			isSplitTurn: cutPoint.isSplitTurn,
+			tokensBefore,
+			previousSummary,
+			fileOps,
+			settings,
+		},
 	};
 }
 
