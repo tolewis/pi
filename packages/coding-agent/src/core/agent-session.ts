@@ -66,6 +66,7 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
 	COMPACTION_FAILURE_CUSTOM_TYPE,
+	type CompactionBackoff,
 	type CompactionFailureData,
 	CompactionModelUnavailableError,
 	type CompactionPreparation,
@@ -76,6 +77,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	deriveCompactionBackoff,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateSummarizationInputTokens,
@@ -822,11 +824,34 @@ export class AgentSession {
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
 	private _exceedsCompactionThreshold(model: Model<any>, projection: SessionProjection): boolean {
 		if (model.contextWindow <= 0) return false;
-		return shouldCompact(
-			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
-			model.contextWindow,
-			this.settingsManager.getCompactionSettings(this.model),
+		return (
+			shouldCompact(
+				estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+				model.contextWindow,
+				this.settingsManager.getCompactionSettings(this.model),
+			) && this._thresholdCompactionAllowed(model.contextWindow)
 		);
+	}
+
+	/**
+	 * Back-off gate shared by every threshold check point. After a failed threshold compaction,
+	 * retry only once the context grew past `retryAtTokens`. After
+	 * `COMPACTION_MAX_CONSECUTIVE_FAILURES` failures, wait for a compaction or a user message.
+	 * Overflow recovery and manual compaction do not use this gate.
+	 */
+	private _thresholdCompactionAllowed(contextWindow: number): boolean {
+		const branch = this.sessionManager.getBranch();
+		const backoff = deriveCompactionBackoff(branch, contextWindow);
+		if (backoff.consecutiveFailures === 0) return true;
+		if (backoff.paused) return false;
+		if (backoff.retryAtTokens === undefined) return true;
+		const tokens = estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens;
+		return tokens >= backoff.retryAtTokens;
+	}
+
+	/** Back-off state of threshold auto-compaction on the current branch, for display. */
+	get compactionBackoff(): CompactionBackoff {
+		return deriveCompactionBackoff(this.sessionManager.getBranch(), this._limitsModel()?.contextWindow ?? 0);
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -1042,6 +1067,15 @@ export class AgentSession {
 						draft.details,
 						true,
 						draft.usage,
+						{
+							reason: "extension",
+							tokensAfter: this._estimateTokensAfterCompaction(
+								manager,
+								draft.summary,
+								draft.firstKeptEntryId,
+								tokensBefore,
+							),
+						},
 					);
 					break;
 				}
@@ -1066,6 +1100,23 @@ export class AgentSession {
 			branchIds,
 		);
 		return validation.ok ? undefined : validation.errorMessage;
+	}
+
+	/**
+	 * Estimate the projected context right after appending a compaction to `manager`, by appending
+	 * it to an in-memory copy of the branch. No provider usage exists yet, so this is chars/4.
+	 */
+	private _estimateTokensAfterCompaction(
+		manager: SessionManager,
+		summary: string,
+		firstKeptEntryId: string | null,
+		tokensBefore: number,
+	): number | undefined {
+		const header = manager.getHeader();
+		if (!header) return undefined;
+		const preview = SessionManager.inMemory(this._cwd, undefined, [header, ...manager.getBranch()]);
+		preview.appendCompaction(summary, firstKeptEntryId, tokensBefore);
+		return estimateProjectedContextTokens(preview.buildSessionProjection(), preview.getBranch()).tokens;
 	}
 
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
@@ -3100,7 +3151,15 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, {
+				reason: "manual",
+				tokensAfter: this._estimateTokensAfterCompaction(
+					this.sessionManager,
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+				),
+			});
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3347,7 +3406,7 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if (shouldCompact(contextTokens, contextWindow, settings) && this._thresholdCompactionAllowed(contextWindow)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -3468,7 +3527,15 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, {
+				reason,
+				tokensAfter: this._estimateTokensAfterCompaction(
+					this.sessionManager,
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+				),
+			});
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3506,9 +3573,15 @@ export class AgentSession {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "compaction failed";
 			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
+			const attempt =
+				reason === "threshold" && !aborted
+					? deriveCompactionBackoff(this.sessionManager.getBranch(), model?.contextWindow ?? 0)
+							.consecutiveFailures + 1
+					: undefined;
 			this._recordCompactionFailure({
 				trigger: reason,
 				outcome: aborted ? "cancelled" : "error",
+				...(attempt !== undefined ? { attempt } : {}),
 				reason: aborted ? "cancelled" : failureReasonFromError(error, "summarizer_error"),
 				...(aborted ? {} : { errorMessage: message }),
 				...(preparation ? { tokensBefore: preparation.tokensBefore } : {}),

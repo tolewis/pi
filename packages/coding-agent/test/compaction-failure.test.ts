@@ -7,6 +7,7 @@ import { prepareCompactionOrSkip } from "../src/core/compaction/compaction.ts";
 import {
 	COMPACTION_FAILURE_CUSTOM_TYPE,
 	type CompactionFailureData,
+	deriveCompactionBackoff,
 	failureModelFromError,
 	failureReasonFromError,
 	formatCompactionFailure,
@@ -108,6 +109,43 @@ describe("compaction failure records", () => {
 		expect(failureReasonFromError(new Error("boom"), "summarizer_error")).toBe("summarizer_error");
 		expect(failureReasonFromError("boom", "cancelled")).toBe("cancelled");
 		expect(failureModelFromError(new Error("boom"))).toBeUndefined();
+	});
+
+	it("derives the back-off from error and timeout records since the last reset", () => {
+		const manager = SessionManager.inMemory();
+		appendUser(manager, "work");
+		expect(deriveCompactionBackoff(manager.getBranch(), 200_000)).toEqual({
+			consecutiveFailures: 0,
+			lastFailureTokensBefore: undefined,
+			retryAtTokens: undefined,
+			paused: false,
+		});
+
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, errorData);
+		appendAssistant(manager, "tool turn");
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, skippedData);
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, { ...errorData, outcome: "cancelled" });
+		// Growth is max(8192, 5% of the window): 8192 for 100k, 10000 for 200k.
+		expect(deriveCompactionBackoff(manager.getBranch(), 100_000)).toMatchObject({
+			consecutiveFailures: 1,
+			retryAtTokens: 128_192,
+			paused: false,
+		});
+		expect(deriveCompactionBackoff(manager.getBranch(), 200_000).retryAtTokens).toBe(130_000);
+
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, { ...errorData, outcome: "timeout", tokensBefore: 1 });
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, { ...errorData, tokensBefore: 140_000 });
+		expect(deriveCompactionBackoff(manager.getBranch(), 100_000)).toMatchObject({
+			consecutiveFailures: 3,
+			lastFailureTokensBefore: 140_000,
+			paused: true,
+		});
+
+		appendUser(manager, "next");
+		expect(deriveCompactionBackoff(manager.getBranch(), 100_000).consecutiveFailures).toBe(0);
+		manager.appendCustomEntry(COMPACTION_FAILURE_CUSTOM_TYPE, errorData);
+		manager.appendCompaction("summary", manager.getBranch()[0]!.id, 100);
+		expect(deriveCompactionBackoff(manager.getBranch(), 100_000).consecutiveFailures).toBe(0);
 	});
 
 	it("tells skip reasons apart", () => {
