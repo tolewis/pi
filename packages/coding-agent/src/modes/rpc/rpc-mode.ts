@@ -13,6 +13,7 @@
 
 import * as crypto from "node:crypto";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import { formatCompactionFailure, isCompactionFailureEntry } from "../../core/compaction/failure.ts";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -354,6 +355,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
 			output(toJsonEvent(event));
+			// Also on stderr (stdout is the protocol), so a pane that keeps only stderr logs keeps the failure.
+			if (event.type === "entry_appended" && isCompactionFailureEntry(event.entry)) {
+				process.stderr.write(`[pi] ${formatCompactionFailure(event.entry.data)}\n`);
+			}
 			if (event.type === "agent_settled") {
 				void checkShutdownRequested();
 			}

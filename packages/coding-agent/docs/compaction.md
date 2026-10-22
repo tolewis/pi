@@ -137,6 +137,33 @@ Never cut at tool results (they must stay with their tool call).
 
 Preparation advances the kept boundary into a context-invisible suffix only when that suffix contains an omitted assistant attempt and no unomitted context-producing entries. Recovery `context_edit` omissions satisfy this rule; intrinsically context-invisible metadata may coexist with them. Metadata alone and newly appended custom messages do not move the cut. A replacement edit affecting the candidate input or summarized prefix also blocks advancement because the omitted assistant answered the pre-edit input; replacements of suffix entries that are ultimately omitted remain safe. This allows an over-budget recovered input to be summarized while retaining the edits that keep the abandoned attempt omitted, without making bookkeeping change whether new model input is preserved verbatim.
 
+### Failure Records
+
+Pi appends a `pi:compaction_failure` custom entry to the session when a compaction does not complete. The entry does not enter model context. The format is in [session-format.md](session-format.md#compaction-failure-record).
+
+Pi writes a record in these cases:
+
+| Case | `outcome` | `reason` |
+|---|---|---|
+| The summarizer or a `session_before_compact` handler throws | `error` | `summarizer_error` |
+| The user or an extension cancels the compaction | `cancelled` | `cancelled` |
+| Auto-compaction is over the threshold, but `keepRecentTokens` keeps all context since the last compaction | `skipped` | `kept_window_exceeds_threshold` |
+| Auto-compaction is over the threshold, but nothing else can be summarized | `skipped` | `nothing_to_summarize` |
+| The retry after one overflow recovery fails again | `error` | `overflow_recovery_exhausted` |
+
+Manual `/compact` failures also get a record with `trigger: "manual"`. Pi still emits `compaction_end` with `errorMessage` and `session_compact_failed` as before.
+
+Pi checks the threshold at several points per turn. To keep one failure from writing many records, Pi skips a record in two cases:
+- `error`, `cancelled`, and `timeout`: the newest entry on the branch is already a failure record with the same `outcome` and `reason`.
+- `skipped` and `fallback`: a failure record with the same `outcome` and `reason` exists after the last compaction and the last user message.
+
+A user message or a successful compaction starts a new episode, so the next failure writes a new record.
+
+Where the record shows:
+- Interactive mode shows one line, `compaction failed (<reason>): <errorMessage>`, with the token count and threshold when present. The line is an entry, so it stays after a re-render or a resume.
+- `--mode json` and `--mode rpc` write the same line to stderr with the prefix `[pi]`. The `entry_appended` event on stdout carries the entry.
+- `--export` HTML keeps the entry in the embedded session data and does not render it.
+
 ### CompactionEntry Structure
 
 Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):
