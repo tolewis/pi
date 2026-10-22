@@ -1,5 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CompactionModelUnavailableError } from "../../src/core/compaction/index.ts";
 import type { SessionBeforeCompactEvent } from "../../src/core/extensions/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -171,5 +172,98 @@ describe("AgentSession compaction model overrides", () => {
 		]);
 		await harness.session.compact();
 		expect(requests).toEqual(["first"]);
+	});
+
+	describe("compaction summarizer model and thinking level", () => {
+		type SummaryRequest = { modelId: string; reasoning: unknown };
+
+		async function compactWith(settings: Record<string, unknown>, sessionThinking: "low" | "medium") {
+			const harness = await createHarness({
+				models: [
+					{ id: "faux-1", reasoning: true },
+					{ id: "faux-summary", reasoning: true },
+				],
+				settings: { compaction: { keepRecentTokens: 150, ...settings } },
+			});
+			harnesses.push(harness);
+			harness.session.agent.state.thinkingLevel = sessionThinking;
+			seedHistory(harness);
+			const requests: SummaryRequest[] = [];
+			harness.setResponses([
+				(_context, options, _state, model) => {
+					requests.push({ modelId: model.id, reasoning: options?.reasoning });
+					return fauxAssistantMessage("summary");
+				},
+			]);
+			return { harness, requests };
+		}
+
+		it("model override thinkingLevel beats the global compaction.thinkingLevel", async () => {
+			const { harness, requests } = await compactWith(
+				{
+					model: "faux-summary",
+					thinkingLevel: "low",
+					modelOverrides: { "faux/faux-1": { thinkingLevel: "high" } },
+				},
+				"medium",
+			);
+			await harness.session.compact();
+			expect(requests).toEqual([{ modelId: "faux-summary", reasoning: "high" }]);
+		});
+
+		it("model override can select the compaction model", async () => {
+			const { harness, requests } = await compactWith(
+				{ modelOverrides: { "faux/faux-1": { model: "faux-summary", thinkingLevel: "off" } } },
+				"medium",
+			);
+			await harness.session.compact();
+			expect(requests).toEqual([{ modelId: "faux-summary", reasoning: undefined }]);
+		});
+
+		it("global thinkingLevel applies without a model override", async () => {
+			const { harness, requests } = await compactWith({ model: "faux-summary", thinkingLevel: "low" }, "medium");
+			await harness.session.compact();
+			expect(requests).toEqual([{ modelId: "faux-summary", reasoning: "low" }]);
+		});
+
+		it("unset thinkingLevel inherits the session thinking level", async () => {
+			const { harness, requests } = await compactWith({}, "low");
+			await harness.session.compact();
+			expect(requests).toEqual([{ modelId: "faux-1", reasoning: "low" }]);
+		});
+
+		it("fails loudly when the configured model is missing and leaves the context unchanged", async () => {
+			const { harness, requests } = await compactWith({ model: "missing-model" }, "medium");
+			const entriesBefore = harness.sessionManager.getEntries().length;
+			const error = await harness.session.compact().catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(CompactionModelUnavailableError);
+			expect((error as CompactionModelUnavailableError).code).toBe("compaction_model_unavailable");
+			expect((error as Error).message).toMatch(/^Compaction model faux\/missing-model is not available: /);
+
+			const sessionInternals = harness.session as unknown as {
+				_runAutoCompaction(reason: "threshold", willRetry: boolean): Promise<boolean>;
+			};
+			await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+			expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBe(
+				"Auto-compaction failed: Compaction model faux/missing-model is not available: not found in the model registry. Check compaction.provider and compaction.model in your settings.",
+			);
+			expect(harness.sessionManager.getEntries()).toHaveLength(entriesBefore);
+			expect(requests).toEqual([]);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		});
+
+		it("fails loudly when the configured model has no auth instead of using the session model", async () => {
+			const { harness, requests } = await compactWith({ model: "faux-summary" }, "medium");
+			const getAuth = harness.session.modelRuntime.getAuth.bind(harness.session.modelRuntime);
+			vi.spyOn(harness.session.modelRuntime, "getAuth").mockImplementation(async (model, ...args) =>
+				model.id === "faux-summary" ? undefined : getAuth(model, ...args),
+			);
+			const entriesBefore = harness.sessionManager.getEntries().length;
+			await expect(harness.session.compact()).rejects.toThrow(
+				/^Compaction model faux\/faux-summary is not available: /,
+			);
+			expect(harness.sessionManager.getEntries()).toHaveLength(entriesBefore);
+			expect(requests).toEqual([]);
+		});
 	});
 });

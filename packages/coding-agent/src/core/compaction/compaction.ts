@@ -132,6 +132,22 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
+/**
+ * Thrown when `compaction.provider` / `compaction.model` name a model that is missing from the
+ * registry or has no auth. Compaction never falls back to the session model in this case.
+ */
+export class CompactionModelUnavailableError extends Error {
+	readonly code = "compaction_model_unavailable";
+	/** "provider/modelId" of the configured compaction model. */
+	readonly model: string;
+
+	constructor(model: string, why: string) {
+		super(`Compaction model ${model} is not available: ${why}`);
+		this.name = "CompactionModelUnavailableError";
+		this.model = model;
+	}
+}
+
 // ============================================================================
 // Token calculation
 // ============================================================================

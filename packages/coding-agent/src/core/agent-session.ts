@@ -65,6 +65,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	CompactionModelUnavailableError,
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
@@ -573,6 +574,7 @@ export class AgentSession {
 		selectedModel: Model<any>,
 		signal?: AbortSignal,
 		selectedThinkingLevel: ThinkingLevel = this.thinkingLevel,
+		requireAuth = false,
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
@@ -588,7 +590,7 @@ export class AgentSession {
 					signal,
 				})
 			: { model: selectedModel, thinkingLevel: selectedThinkingLevel };
-		if (this.agent.streamFunction === streamSimple) {
+		if (requireAuth || this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
 
@@ -613,7 +615,7 @@ export class AgentSession {
 		settings: { provider?: string; model?: string; thinkingLevel?: ThinkingLevel },
 		fallbackModel: Model<any> | undefined,
 		settingsKey: "compaction" | "branchSummary",
-	): { model: Model<any>; thinkingLevel: ThinkingLevel } {
+	): { model: Model<any>; thinkingLevel: ThinkingLevel; configured: boolean } {
 		const hasModelOverride = settings.provider !== undefined || settings.model !== undefined;
 		const provider = settings.provider ?? fallbackModel?.provider;
 		const modelId = settings.model ?? fallbackModel?.id;
@@ -627,6 +629,12 @@ export class AgentSession {
 		}
 
 		const model = hasModelOverride ? this._modelRuntime.getModel(provider, modelId) : fallbackModel;
+		if (!model && settingsKey === "compaction") {
+			throw new CompactionModelUnavailableError(
+				`${provider}/${modelId}`,
+				"not found in the model registry. Check compaction.provider and compaction.model in your settings.",
+			);
+		}
 		if (!model) {
 			throw new Error(
 				`Summarization model not found: ${provider}/${modelId}. Check ${settingsKey}.provider and ${settingsKey}.model in your settings.`,
@@ -636,6 +644,7 @@ export class AgentSession {
 		return {
 			model,
 			thinkingLevel: clampThinkingLevel(model, settings.thinkingLevel ?? this.thinkingLevel),
+			configured: hasModelOverride,
 		};
 	}
 
@@ -2821,7 +2830,7 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const summaryConfig = this._getSummarizationModel(settings, model, "compaction");
-		const request = await this._getSummarizationRequestAuth(summaryConfig.model, signal, summaryConfig.thinkingLevel);
+		const request = await this._getCompactionRequestAuth(summaryConfig, signal);
 		return compact(
 			preparation,
 			request.model,
@@ -2836,6 +2845,26 @@ export class AgentSession {
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
 		);
+	}
+
+	/**
+	 * Resolve auth for the compaction summarizer. A configured compaction model must have auth:
+	 * a failure throws CompactionModelUnavailableError instead of a silent unauthenticated request.
+	 */
+	private async _getCompactionRequestAuth(
+		summaryConfig: { model: Model<any>; thinkingLevel: ThinkingLevel; configured: boolean },
+		signal: AbortSignal,
+	): ReturnType<AgentSession["_getSummarizationRequestAuth"]> {
+		if (!summaryConfig.configured) {
+			return this._getSummarizationRequestAuth(summaryConfig.model, signal, summaryConfig.thinkingLevel);
+		}
+		try {
+			return await this._getSummarizationRequestAuth(summaryConfig.model, signal, summaryConfig.thinkingLevel, true);
+		} catch (error) {
+			if (signal.aborted) throw error;
+			const why = error instanceof Error ? error.message : String(error);
+			throw new CompactionModelUnavailableError(`${summaryConfig.model.provider}/${summaryConfig.model.id}`, why);
+		}
 	}
 
 	private _clearManualCompactionState(): void {

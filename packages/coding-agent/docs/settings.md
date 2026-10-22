@@ -73,18 +73,30 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Free context tokens below which automatic compaction starts. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
-| `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
+| `compaction.modelOverrides` | object | None | Per-model settings keyed by the exact session `provider/modelId`: `reserveTokens`, `keepRecentTokens`, `provider`, `model`, `thinkingLevel`. |
 | `compaction.provider` | string | current session provider | Provider used for compaction summaries. |
 | `compaction.model` | string | current session model | Model ID used for compaction summaries. |
 | `compaction.thinkingLevel` | string | current session thinking level | Thinking level for compaction summaries: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
 
-`compaction.provider` and `compaction.model` can be set independently. An omitted component is inherited from the current session model. Explicit model settings must resolve to an existing model; invalid settings produce an error rather than falling back to the session model.
+`compaction.provider` and `compaction.model` can be set independently. An omitted component is inherited from the current session model. Explicit model settings must resolve to an existing model with auth. If the model is missing or has no auth, compaction fails with `Compaction model <provider/id> is not available: <why>`. It does not fall back to the session model.
 
 Choose a summary model whose context window can accommodate the history being summarized. Compaction does not split that history to fit a smaller summary model or automatically fall back to another model. Automatic compaction thresholds still use the session model's context window. If the summary model has a smaller window, increase `compaction.reserveTokens` (or its session-model override) to compact earlier.
 
 <a id="per-model-compaction-overrides"></a>
 
 Compaction token values must be non-negative safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+
+`provider`, `model`, and `thinkingLevel` resolve the same way: the override for the session model, then `compaction.*`, then the session model and thinking level. For example, this keeps the session thinking level for every model except one local model, which summarizes with thinking off:
+
+```json
+{
+  "compaction": {
+    "modelOverrides": {
+      "vllm/qwen3-coder": { "thinkingLevel": "off" }
+    }
+  }
+}
+```
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 

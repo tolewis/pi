@@ -13,6 +13,9 @@ function timeoutSetting(options?: TSchemaOptions) {
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 });
 
 const CompactionSettingsSchema = Type.Object({

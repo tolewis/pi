@@ -459,7 +459,7 @@ describe("AgentSession compaction characterization", () => {
 		harnesses.push(harness);
 
 		await expect(harness.session.compact()).rejects.toThrow(
-			"Summarization model not found: missing-provider/faux-1. Check compaction.provider and compaction.model in your settings.",
+			"Compaction model missing-provider/faux-1 is not available: not found in the model registry. Check compaction.provider and compaction.model in your settings.",
 		);
 	});
 

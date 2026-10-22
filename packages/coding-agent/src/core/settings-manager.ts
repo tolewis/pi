@@ -50,10 +50,13 @@ export type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+
+type CompactionTokenField = "reserveTokens" | "keepRecentTokens";
+
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<Pick<CompactionModelOverride, CompactionTokenField>> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
@@ -831,7 +834,7 @@ export class SettingsManager {
 	}
 
 	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
+		field: CompactionTokenField,
 		model?: Pick<Model<string>, "provider" | "id">,
 	): number {
 		const compaction = this.settings.compaction;
@@ -866,7 +869,22 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Resolve a summarizer field through the model override, then the ordinary setting. Unset means inherit. */
+	private getCompactionSummarizerSetting<K extends "provider" | "model" | "thinkingLevel">(
+		field: K,
+		model?: Pick<Model<string>, "provider" | "id">,
+	): CompactionModelOverride[K] {
+		const compaction = this.settings.compaction;
+		const entry = model ? compaction?.modelOverrides?.[`${model.provider}/${model.id}`] : undefined;
+		const override = isMergeableObject(entry) ? entry[field] : undefined;
+		return override ?? compaction?.[field];
+	}
+
+	/**
+	 * Resolve each token setting through model override, ordinary setting, then built-in default.
+	 * Summarizer `provider`, `model`, and `thinkingLevel` resolve through model override, then
+	 * ordinary setting; undefined means inherit from the session.
+	 */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
@@ -879,9 +897,9 @@ export class SettingsManager {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
-			provider: this.settings.compaction?.provider,
-			model: this.settings.compaction?.model,
-			thinkingLevel: this.settings.compaction?.thinkingLevel,
+			provider: this.getCompactionSummarizerSetting("provider", model),
+			model: this.getCompactionSummarizerSetting("model", model),
+			thinkingLevel: this.getCompactionSummarizerSetting("thinkingLevel", model),
 		};
 	}
 
