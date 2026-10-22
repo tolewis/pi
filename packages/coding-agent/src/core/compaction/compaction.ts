@@ -113,6 +113,34 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 }
 
+export type CompactionResultValidation = { ok: true } | { ok: false; errorMessage: string };
+
+/**
+ * Check a compaction result supplied by an extension before it is persisted.
+ * Extensions are untyped at runtime, so every field is checked by value.
+ */
+export function validateCompactionResult(
+	result: CompactionResult,
+	branchEntryIds: ReadonlySet<string>,
+): CompactionResultValidation {
+	if (typeof result.summary !== "string" || result.summary.trim() === "") {
+		return { ok: false, errorMessage: "Extension compaction result has an empty summary" };
+	}
+	if (typeof result.firstKeptEntryId !== "string" || !branchEntryIds.has(result.firstKeptEntryId)) {
+		return {
+			ok: false,
+			errorMessage: `Extension compaction result firstKeptEntryId ${JSON.stringify(result.firstKeptEntryId)} is not on the current branch`,
+		};
+	}
+	if (typeof result.tokensBefore !== "number" || !Number.isFinite(result.tokensBefore) || result.tokensBefore < 0) {
+		return {
+			ok: false,
+			errorMessage: `Extension compaction result tokensBefore ${String(result.tokensBefore)} is not a finite number >= 0`,
+		};
+	}
+	return { ok: true };
+}
+
 // ============================================================================
 // Types
 // ============================================================================

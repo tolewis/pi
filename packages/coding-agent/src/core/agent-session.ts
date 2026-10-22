@@ -76,6 +76,7 @@ import {
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
+	validateCompactionResult,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
@@ -2805,6 +2806,22 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * An extension returned a compaction result that must not persist. Treat it like a
+	 * throwing handler: report it, then the caller runs the default compaction.
+	 */
+	private _reportInvalidExtensionCompaction(
+		_trigger: "manual" | "threshold" | "overflow",
+		errorMessage: string,
+		_tokensBefore: number,
+	): void {
+		this._extensionRunner.emitError({
+			extensionPath: "<compaction>",
+			event: "session_before_compact",
+			error: errorMessage,
+		});
+	}
+
 	private _clearManualCompactionState(): void {
 		this._compactionAbortController = undefined;
 		this._resolveIdleWaitIfIdle();
@@ -2870,8 +2887,16 @@ export class AgentSession {
 				}
 
 				if (result?.compaction) {
-					extensionCompaction = result.compaction;
-					fromExtension = true;
+					const validation = validateCompactionResult(
+						result.compaction,
+						new Set(pathEntries.map((entry) => entry.id)),
+					);
+					if (validation.ok) {
+						extensionCompaction = result.compaction;
+						fromExtension = true;
+					} else {
+						this._reportInvalidExtensionCompaction("manual", validation.errorMessage, preparation.tokensBefore);
+					}
 				}
 			}
 
@@ -3198,8 +3223,16 @@ export class AgentSession {
 				}
 
 				if (extensionResult?.compaction) {
-					extensionCompaction = extensionResult.compaction;
-					fromExtension = true;
+					const validation = validateCompactionResult(
+						extensionResult.compaction,
+						new Set(pathEntries.map((entry) => entry.id)),
+					);
+					if (validation.ok) {
+						extensionCompaction = extensionResult.compaction;
+						fromExtension = true;
+					} else {
+						this._reportInvalidExtensionCompaction(reason, validation.errorMessage, preparation.tokensBefore);
+					}
 				}
 			}
 			abortController.signal.throwIfAborted();

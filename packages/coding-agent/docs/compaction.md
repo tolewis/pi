@@ -334,6 +334,14 @@ pi.on("session_before_compact", async (event, ctx) => {
 });
 ```
 
+Pi validates a custom result before it saves it:
+
+- `summary` must be a string that is not empty after trim.
+- `firstKeptEntryId` must be the id of an entry on the current branch.
+- `tokensBefore` must be a finite number that is 0 or more.
+
+If a check fails, Pi does not save the result. It reports an extension error for `session_before_compact` with the reason, and then runs the default compaction, the same as when a handler throws. Pi also rejects a default summary that has no text, for example a reply with only thinking blocks. That compaction fails and saves nothing.
+
 #### Converting Messages to Text
 
 To generate a summary with your own model, convert messages to text using `serializeConversation`:

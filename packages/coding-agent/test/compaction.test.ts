@@ -15,6 +15,7 @@ import {
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
+	validateCompactionResult,
 } from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
@@ -693,6 +694,47 @@ describe("summarization prompt goal rule", () => {
 		expect(prompt).toContain("Copy the original request quote from the previous summary verbatim.");
 		expect(prompt).toContain('KEEP the "Original request" quote under ## Goal verbatim.');
 		expect(prompt).toContain("Superseded by: <short text>");
+	});
+});
+
+describe("validateCompactionResult", () => {
+	const branchIds: ReadonlySet<string> = new Set(["a", "b"]);
+	const valid = { summary: "## Goal\nwork", firstKeptEntryId: "b", tokensBefore: 100 };
+
+	it("accepts a valid result", () => {
+		expect(validateCompactionResult(valid, branchIds)).toEqual({ ok: true });
+		expect(validateCompactionResult({ ...valid, tokensBefore: 0 }, branchIds)).toEqual({ ok: true });
+	});
+
+	it.each([
+		["empty", ""],
+		["whitespace", " \n\t"],
+		["not a string", 42],
+	])("rejects a summary that is %s", (_name, summary) => {
+		const result = validateCompactionResult({ ...valid, summary } as unknown as typeof valid, branchIds);
+		expect(result).toEqual({ ok: false, errorMessage: "Extension compaction result has an empty summary" });
+	});
+
+	it.each([
+		["off the branch", "c"],
+		["missing", undefined],
+		["null", null],
+	])("rejects a firstKeptEntryId that is %s", (_name, firstKeptEntryId) => {
+		const result = validateCompactionResult({ ...valid, firstKeptEntryId } as unknown as typeof valid, branchIds);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.errorMessage).toContain("is not on the current branch");
+	});
+
+	it.each([
+		["NaN", Number.NaN],
+		["Infinity", Number.POSITIVE_INFINITY],
+		["negative", -1],
+		["not a number", "100"],
+		["missing", undefined],
+	])("rejects tokensBefore that is %s", (_name, tokensBefore) => {
+		const result = validateCompactionResult({ ...valid, tokensBefore } as unknown as typeof valid, branchIds);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.errorMessage).toContain("is not a finite number >= 0");
 	});
 });
 
