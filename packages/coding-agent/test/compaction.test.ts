@@ -653,6 +653,49 @@ describe("empty summary rejection", () => {
 	});
 });
 
+describe("summarization prompt goal rule", () => {
+	async function capturePrompt(previousSummary?: string): Promise<string> {
+		let prompt = "";
+		const streamFn: StreamFn = (_model, context) => {
+			const content = context.messages[context.messages.length - 1]?.content;
+			prompt = Array.isArray(content)
+				? content.map((block) => (block.type === "text" ? block.text : "")).join("")
+				: "";
+			const stream = createAssistantMessageEventStream();
+			stream.end(createAssistantMessage("## Goal\nsummary"));
+			return stream;
+		};
+		await generateSummaryWithUsage(
+			[createUserMessage("Fix the parser")],
+			getModel("anthropic", "claude-sonnet-4-5")!,
+			undefined,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			previousSummary,
+			undefined,
+			streamFn,
+		);
+		return prompt;
+	}
+
+	it("asks for the original request verbatim in the initial prompt", async () => {
+		const prompt = await capturePrompt();
+		expect(prompt).toContain('Original request: "[The first user message of the conversation, quoted verbatim.');
+		expect(prompt).toContain("at most 2,000 characters and mark a cut with [...]");
+		expect(prompt).toContain("Never paraphrase it.");
+		expect(prompt).toContain("Superseded by: <short text>");
+	});
+
+	it("keeps the original request quote verbatim in the update prompt", async () => {
+		const prompt = await capturePrompt('## Goal\nOriginal request: "Fix the parser"');
+		expect(prompt).toContain("Copy the original request quote from the previous summary verbatim.");
+		expect(prompt).toContain('KEEP the "Original request" quote under ## Goal verbatim.');
+		expect(prompt).toContain("Superseded by: <short text>");
+	});
+});
+
 // ============================================================================
 // LLM integration tests (skipped without API key)
 // ============================================================================

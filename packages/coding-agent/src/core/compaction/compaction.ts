@@ -509,7 +509,9 @@ const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize
 Use this EXACT format:
 
 ## Goal
+Original request: "[The first user message of the conversation, quoted verbatim. Quote at most 2,000 characters and mark a cut with [...]. Never paraphrase it.]"
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+[If later messages changed the goal, add one line after the quote: Superseded by: <short text>]
 
 ## Constraints & Preferences
 - [Any constraints, preferences, or requirements mentioned by user]
@@ -544,11 +546,14 @@ const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summar
 - UPDATE "Next Steps" based on what was accomplished
 - PRESERVE exact file paths, function names, and error messages
 - If something is no longer relevant, you may remove it
+- KEEP the "Original request" quote under ## Goal verbatim. Never paraphrase or remove it
 
 Use this EXACT format:
 
 ## Goal
+Original request: "[Copy the original request quote from the previous summary verbatim. Never paraphrase or shorten it. If the previous summary has no quote, quote the first user message verbatim, at most 2,000 characters, and mark a cut with [...].]"
 [Preserve existing goals, add new ones if the task expanded]
+[If later messages changed the goal, keep or add one line after the quote: Superseded by: <short text>]
 
 ## Constraints & Preferences
 - [Preserve existing, add new ones discovered]

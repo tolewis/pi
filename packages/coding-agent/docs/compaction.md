@@ -239,6 +239,7 @@ Compaction summaries use this format:
 
 ```markdown
 ## Goal
+Original request: "[First user message, verbatim]"
 [What the user is trying to accomplish]
 
 ## Constraints & Preferences
@@ -272,6 +273,8 @@ path/to/file2.ts
 path/to/changed.ts
 </modified-files>
 ```
+
+The Goal section starts with the original request. The summarizer quotes the first user message of the session verbatim, at most 2,000 characters, and marks a cut with `[...]`. Each later compaction copies the quote from the previous summary without change. If the goal changed later in the session, the summarizer adds one `Superseded by: <short text>` line after the quote. This keeps the user's exact words across many compactions, where repeated paraphrase would drift. The rule is in the prompt only. Pi does not check that the model follows it.
 
 ### Message Serialization
 
