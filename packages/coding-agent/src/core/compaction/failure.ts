@@ -140,3 +140,42 @@ export function formatCompactionFailure(data: CompactionFailureData): string {
 	if (numbers.length > 0) text += ` [${numbers.join(", ")}]`;
 	return text;
 }
+
+/** Back-off state of threshold auto-compaction, derived from the session branch (C4). */
+export interface CompactionBackoff {
+	/** `error` and `timeout` records since the last compaction and the last user message. */
+	consecutiveFailures: number;
+	/** `tokensBefore` of the newest counted failure, when it recorded one. */
+	lastFailureTokensBefore: number | undefined;
+	/** Context size at which a retry is allowed again, when `lastFailureTokensBefore` is known. */
+	retryAtTokens: number | undefined;
+	/** True after `COMPACTION_MAX_CONSECUTIVE_FAILURES` failures: no threshold compaction until reset. */
+	paused: boolean;
+}
+
+/**
+ * Derive the threshold back-off from failure records on `branch`. The walk goes from the newest
+ * entry back to the last compaction or the last user message, whichever is later, so a
+ * successful compaction or a user message resets it. Only `error` and `timeout` count: a skip
+ * is a budget problem and a cancellation is a user decision, not a summarizer failure.
+ * The session file is the only state, so a resumed session derives the same back-off.
+ */
+export function deriveCompactionBackoff(branch: SessionEntry[], contextWindow: number): CompactionBackoff {
+	let consecutiveFailures = 0;
+	let lastFailureTokensBefore: number | undefined;
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type === "compaction" || isUserMessageEntry(entry)) break;
+		if (!isCompactionFailureEntry(entry)) continue;
+		if (entry.data.outcome !== "error" && entry.data.outcome !== "timeout") continue;
+		if (consecutiveFailures === 0) lastFailureTokensBefore = entry.data.tokensBefore;
+		consecutiveFailures++;
+	}
+	const growth = Math.max(COMPACTION_RETRY_GROWTH_MIN_TOKENS, COMPACTION_RETRY_GROWTH_FRACTION * contextWindow);
+	return {
+		consecutiveFailures,
+		lastFailureTokensBefore,
+		retryAtTokens: lastFailureTokensBefore === undefined ? undefined : lastFailureTokensBefore + growth,
+		paused: consecutiveFailures >= COMPACTION_MAX_CONSECUTIVE_FAILURES,
+	};
+}

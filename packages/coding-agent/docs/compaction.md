@@ -164,6 +164,17 @@ Where the record shows:
 - `--mode json` and `--mode rpc` write the same line to stderr with the prefix `[pi]`. The `entry_appended` event on stdout carries the entry.
 - `--export` HTML keeps the entry in the embedded session data and does not render it.
 
+### Threshold Back-off
+
+Failure records also limit retries of threshold auto-compaction. Pi counts the `error` and `timeout` records after the last compaction and the last user message. Skipped and cancelled records do not count.
+
+- After a failure, pi retries only when the context grows by `max(8192, 5% of the context window)` tokens past the `tokensBefore` of the newest failure.
+- After 3 consecutive failures, threshold auto-compaction pauses. The footer shows `auto-compaction paused (3 failures)`.
+- A user message or a successful compaction, for example `/compact`, resets the count.
+- Overflow recovery and manual compaction do not use this back-off.
+
+Pi derives the back-off from the session file only. A resumed session keeps the same state.
+
 ### CompactionEntry Structure
 
 Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):

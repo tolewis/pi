@@ -53,6 +53,8 @@ interface SessionStats {
 	usageTotals: UsageTotals;
 	latestCacheHitRate: number | undefined;
 	contextUsage: ContextUsage | undefined;
+	/** Consecutive compaction failures while threshold auto-compaction is paused, else undefined. */
+	compactionPausedFailures: number | undefined;
 }
 
 /**
@@ -141,7 +143,9 @@ export class FooterComponent implements Component {
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
+		const backoff = this.session.compactionBackoff;
 		this.sessionStats = {
+			compactionPausedFailures: backoff.paused ? backoff.consecutiveFailures : undefined,
 			session: this.session,
 			sessionId,
 			leafId,
@@ -156,7 +160,7 @@ export class FooterComponent implements Component {
 
 	render(width: number): string[] {
 		const state = this.session.state;
-		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
+		const { usageTotals, latestCacheHitRate, contextUsage, compactionPausedFailures } = this.getSessionStats();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
@@ -210,6 +214,9 @@ export class FooterComponent implements Component {
 			contextPercentStr = contextPercentDisplay;
 		}
 		statsParts.push(contextPercentStr);
+		if (this.autoCompactEnabled && compactionPausedFailures !== undefined) {
+			statsParts.push(theme.fg("warning", `auto-compaction paused (${compactionPausedFailures} failures)`));
+		}
 		if (areExperimentalFeaturesEnabled()) {
 			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
 		}

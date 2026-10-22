@@ -66,6 +66,7 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
 	COMPACTION_FAILURE_CUSTOM_TYPE,
+	type CompactionBackoff,
 	type CompactionFailureData,
 	type CompactionPreparation,
 	type CompactionResult,
@@ -74,6 +75,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	deriveCompactionBackoff,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -774,11 +776,34 @@ export class AgentSession {
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
 	private _exceedsCompactionThreshold(model: Model<any>, projection: SessionProjection): boolean {
 		if (model.contextWindow <= 0) return false;
-		return shouldCompact(
-			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
-			model.contextWindow,
-			this.settingsManager.getCompactionSettings(this.model),
+		return (
+			shouldCompact(
+				estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+				model.contextWindow,
+				this.settingsManager.getCompactionSettings(this.model),
+			) && this._thresholdCompactionAllowed(model.contextWindow)
 		);
+	}
+
+	/**
+	 * Back-off gate shared by every threshold check point. After a failed threshold compaction,
+	 * retry only once the context grew past `retryAtTokens`. After
+	 * `COMPACTION_MAX_CONSECUTIVE_FAILURES` failures, wait for a compaction or a user message.
+	 * Overflow recovery and manual compaction do not use this gate.
+	 */
+	private _thresholdCompactionAllowed(contextWindow: number): boolean {
+		const branch = this.sessionManager.getBranch();
+		const backoff = deriveCompactionBackoff(branch, contextWindow);
+		if (backoff.consecutiveFailures === 0) return true;
+		if (backoff.paused) return false;
+		if (backoff.retryAtTokens === undefined) return true;
+		const tokens = estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens;
+		return tokens >= backoff.retryAtTokens;
+	}
+
+	/** Back-off state of threshold auto-compaction on the current branch, for display. */
+	get compactionBackoff(): CompactionBackoff {
+		return deriveCompactionBackoff(this.sessionManager.getBranch(), this._limitsModel()?.contextWindow ?? 0);
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -3233,7 +3258,7 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if (shouldCompact(contextTokens, contextWindow, settings) && this._thresholdCompactionAllowed(contextWindow)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -3391,9 +3416,15 @@ export class AgentSession {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "compaction failed";
 			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
+			const attempt =
+				reason === "threshold" && !aborted
+					? deriveCompactionBackoff(this.sessionManager.getBranch(), model?.contextWindow ?? 0)
+							.consecutiveFailures + 1
+					: undefined;
 			this._recordCompactionFailure({
 				trigger: reason,
 				outcome: aborted ? "cancelled" : "error",
+				...(attempt !== undefined ? { attempt } : {}),
 				reason: aborted ? "cancelled" : failureReasonFromError(error, "summarizer_error"),
 				...(aborted ? {} : { errorMessage: message }),
 				...(preparation ? { tokensBefore: preparation.tokensBefore } : {}),

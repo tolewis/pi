@@ -454,6 +454,7 @@ describe("AgentSession compaction characterization", () => {
 			{
 				trigger: "threshold",
 				outcome: "error",
+				attempt: 1,
 				reason: "summarizer_error",
 				errorMessage: "summary generator blew up",
 				tokensBefore: expect.any(Number),
