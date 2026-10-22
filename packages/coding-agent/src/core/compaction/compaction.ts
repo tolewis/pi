@@ -149,6 +149,9 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	provider?: string;
+	model?: string;
+	thinkingLevel?: ThinkingLevel;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
@@ -157,9 +160,31 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
+/**
+ * Thrown when `compaction.provider` / `compaction.model` name a model that is missing from the
+ * registry or has no auth. Compaction never falls back to the session model in this case.
+ */
+export class CompactionModelUnavailableError extends Error {
+	readonly code = "compaction_model_unavailable";
+	/** "provider/modelId" of the configured compaction model. */
+	readonly model: string;
+
+	constructor(model: string, why: string) {
+		super(`Compaction model ${model} is not available: ${why}`);
+		this.name = "CompactionModelUnavailableError";
+		this.model = model;
+	}
+}
+
 // ============================================================================
 // Token calculation
 // ============================================================================
+
+/**
+ * Output tokens reserved for the summary when a separate compaction model is checked for fit.
+ * The window-fit guard requires input + this allowance <= the compaction model's context window.
+ */
+export const SUMMARY_OUTPUT_ALLOWANCE_TOKENS = 8192;
 
 /**
  * Calculate total context tokens from usage.
@@ -819,6 +844,18 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+}
+
+/**
+ * Estimate the tokens sent to the summarizer for a preparation (chars/4 heuristic).
+ * Counts the history, the split-turn prefix, and the previous summary. A split turn sends
+ * these in two requests, so the sum is an upper bound for each request.
+ */
+export function estimateSummarizationInputTokens(preparation: CompactionPreparation): number {
+	let tokens = Math.ceil((preparation.previousSummary?.length ?? 0) / 4);
+	for (const message of preparation.messagesToSummarize) tokens += estimateTokens(message);
+	for (const message of preparation.turnPrefixMessages) tokens += estimateTokens(message);
+	return tokens;
 }
 
 function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {

@@ -13,9 +13,15 @@ function timeoutSetting(options?: TSchemaOptions) {
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 });
 
 const CompactionSettingsSchema = Type.Object({
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
@@ -27,6 +33,9 @@ const CompactionSettingsSchema = Type.Object({
 });
 
 const BranchSummarySettingsSchema = Type.Object({
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 	reserveTokens: Type.Optional(
 		Type.Number({
 			description: "Tokens reserved for the prompt and LLM response.",

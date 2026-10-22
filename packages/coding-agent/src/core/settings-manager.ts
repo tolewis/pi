@@ -50,10 +50,13 @@ export type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+
+type CompactionTokenField = "reserveTokens" | "keepRecentTokens";
+
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<Pick<CompactionModelOverride, CompactionTokenField>> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
@@ -831,7 +834,7 @@ export class SettingsManager {
 	}
 
 	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
+		field: CompactionTokenField,
 		model?: Pick<Model<string>, "provider" | "id">,
 	): number {
 		const compaction = this.settings.compaction;
@@ -866,28 +869,75 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Resolve a summarizer field through the model override, then the ordinary setting. Unset means inherit. */
+	private getCompactionSummarizerSetting<K extends "provider" | "model" | "thinkingLevel">(
+		field: K,
+		model?: Pick<Model<string>, "provider" | "id">,
+	): CompactionModelOverride[K] {
+		const compaction = this.settings.compaction;
+		const entry = model ? compaction?.modelOverrides?.[`${model.provider}/${model.id}`] : undefined;
+		const override = isMergeableObject(entry) ? entry[field] : undefined;
+		return override ?? compaction?.[field];
+	}
+
+	/**
+	 * Resolve each token setting through model override, ordinary setting, then built-in default.
+	 * Summarizer `provider`, `model`, and `thinkingLevel` resolve through model override, then
+	 * ordinary setting; undefined means inherit from the session.
+	 */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: ThinkingLevel;
 	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			provider: this.getCompactionSummarizerSetting("provider", model),
+			model: this.getCompactionSummarizerSetting("model", model),
+			thinkingLevel: this.getCompactionSummarizerSetting("thinkingLevel", model),
 		};
 	}
 
-	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
+	getBranchSummarySettings(): {
+		reserveTokens: number;
+		skipPrompt: boolean;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: ThinkingLevel;
+	} {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? SETTINGS_DEFAULTS.branchSummary.reserveTokens,
 			skipPrompt: this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt,
+			provider: this.settings.branchSummary?.provider,
+			model: this.settings.branchSummary?.model,
+			thinkingLevel: this.settings.branchSummary?.thinkingLevel,
 		};
 	}
 
 	getBranchSummarySkipPrompt(): boolean {
 		return this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt;
+	}
+
+	setSummarizationConfig(
+		settingsKey: "compaction" | "branchSummary",
+		provider: string,
+		model: string,
+		thinkingLevel: ThinkingLevel,
+	): void {
+		const settings = this.globalSettings[settingsKey] ?? {};
+		this.globalSettings[settingsKey] = settings;
+		settings.provider = provider;
+		settings.model = model;
+		settings.thinkingLevel = thinkingLevel;
+		this.markModified(settingsKey, "provider");
+		this.markModified(settingsKey, "model");
+		this.markModified(settingsKey, "thinkingLevel");
+		this.save();
 	}
 
 	getRetryEnabled(): boolean {
