@@ -137,6 +137,33 @@ Never cut at tool results (they must stay with their tool call).
 
 Preparation advances the kept boundary into a context-invisible suffix only when that suffix contains an omitted assistant attempt and no unomitted context-producing entries. Recovery `context_edit` omissions satisfy this rule; intrinsically context-invisible metadata may coexist with them. Metadata alone and newly appended custom messages do not move the cut. A replacement edit affecting the candidate input or summarized prefix also blocks advancement because the omitted assistant answered the pre-edit input; replacements of suffix entries that are ultimately omitted remain safe. This allows an over-budget recovered input to be summarized while retaining the edits that keep the abandoned attempt omitted, without making bookkeeping change whether new model input is preserved verbatim.
 
+### Failure Records
+
+Pi appends a `pi:compaction_failure` custom entry to the session when a compaction does not complete. The entry does not enter model context. The format is in [session-format.md](session-format.md#compaction-failure-record).
+
+Pi writes a record in these cases:
+
+| Case | `outcome` | `reason` |
+|---|---|---|
+| The summarizer or a `session_before_compact` handler throws | `error` | `summarizer_error` |
+| The user or an extension cancels the compaction | `cancelled` | `cancelled` |
+| Auto-compaction is over the threshold, but `keepRecentTokens` keeps all context since the last compaction | `skipped` | `kept_window_exceeds_threshold` |
+| Auto-compaction is over the threshold, but nothing else can be summarized | `skipped` | `nothing_to_summarize` |
+| The retry after one overflow recovery fails again | `error` | `overflow_recovery_exhausted` |
+
+Manual `/compact` failures also get a record with `trigger: "manual"`. Pi still emits `compaction_end` with `errorMessage` and `session_compact_failed` as before.
+
+Pi checks the threshold at several points per turn. To keep one failure from writing many records, Pi skips a record in two cases:
+- `error`, `cancelled`, and `timeout`: the newest entry on the branch is already a failure record with the same `outcome` and `reason`.
+- `skipped` and `fallback`: a failure record with the same `outcome` and `reason` exists after the last compaction and the last user message.
+
+A user message or a successful compaction starts a new episode, so the next failure writes a new record.
+
+Where the record shows:
+- Interactive mode shows one line, `compaction failed (<reason>): <errorMessage>`, with the token count and threshold when present. The line is an entry, so it stays after a re-render or a resume.
+- `--mode json` and `--mode rpc` write the same line to stderr with the prefix `[pi]`. The `entry_appended` event on stdout carries the entry.
+- `--export` HTML keeps the entry in the embedded session data and does not render it.
+
 ### CompactionEntry Structure
 
 Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):
@@ -239,6 +266,7 @@ Compaction summaries use this format:
 
 ```markdown
 ## Goal
+Original request: "[First user message, verbatim]"
 [What the user is trying to accomplish]
 
 ## Constraints & Preferences
@@ -272,6 +300,8 @@ path/to/file2.ts
 path/to/changed.ts
 </modified-files>
 ```
+
+The Goal section starts with the original request. The summarizer quotes the first user message of the session verbatim, at most 2,000 characters, and marks a cut with `[...]`. Each later compaction copies the quote from the previous summary without change. If the goal changed later in the session, the summarizer adds one `Superseded by: <short text>` line after the quote. This keeps the user's exact words across many compactions, where repeated paraphrase would drift. The rule is in the prompt only. Pi does not check that the model follows it.
 
 ### Message Serialization
 
@@ -330,6 +360,14 @@ pi.on("session_before_compact", async (event, ctx) => {
   };
 });
 ```
+
+Pi validates a custom result before it saves it:
+
+- `summary` must be a string that is not empty after trim.
+- `firstKeptEntryId` must be the id of an entry on the current branch.
+- `tokensBefore` must be a finite number that is 0 or more.
+
+If a check fails, Pi does not save the result. It reports an extension error for `session_before_compact` with the reason, and then runs the default compaction, the same as when a handler throws. The error shows the path `<compaction>`, not the path of the extension, because Pi combines the handler results before it checks them. Pi also checks `compaction` drafts that `turn_end` and `agent_before_settle` handlers return. A `null` `firstKeptEntryId` is valid there. Pi drops an invalid draft, applies the other drafts, and reports an extension error for that event. There is no default compaction on this path. In both cases Pi also appends a `pi:compaction_failure` entry with `reason: "invalid_extension_result"` and `fromExtension: true`. A default summary with no text produces a failure entry with `reason: "empty_summary"`. Pi also rejects a default summary that has no text, for example a reply with only thinking blocks. That compaction fails and saves nothing.
 
 #### Converting Messages to Text
 

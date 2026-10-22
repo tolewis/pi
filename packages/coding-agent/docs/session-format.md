@@ -173,6 +173,29 @@ Use `customType` to identify your extension's entries on reload. Interactive mod
 
 Pi stores [virtual model](virtual-models.md) router state as custom entries with `customType` `pi.virtual-model-state` and `data` `{ provider, modelId, state }`.
 
+The `customType` prefix `pi:` is reserved for core. Interactive mode renders `pi:` types with core renderers, and `pi.registerEntryRenderer()` throws for a `pi:` type. Extensions can still read these entries.
+
+#### Compaction failure record
+
+Pi appends a custom entry with `customType` `pi:compaction_failure` when a compaction fails, is cancelled, or is skipped while the context is over the threshold. See [compaction.md](compaction.md#failure-records) for when Pi writes it.
+
+```json
+{"type":"custom","id":"h9i0j1k2","parentId":"g7h8i9j0","timestamp":"2024-12-03T14:21:00.000Z","customType":"pi:compaction_failure","data":{"trigger":"threshold","outcome":"error","reason":"summarizer_error","errorMessage":"Summarization failed: 529 overloaded","tokensBefore":120000,"contextWindow":131072,"threshold":114688,"model":"anthropic/claude-sonnet-4-5"}}
+```
+
+`data` fields:
+- `trigger`: `"manual"`, `"threshold"`, `"overflow"`, or `"extension"`. What started the compaction.
+- `outcome`: `"error"`, `"cancelled"`, `"skipped"`, `"timeout"`, or `"fallback"`.
+- `reason`: A machine-readable cause, for example `"summarizer_error"`, `"cancelled"`, `"kept_window_exceeds_threshold"`, `"nothing_to_summarize"`, or `"overflow_recovery_exhausted"`. Consumers should accept unknown values.
+- `errorMessage`: Optional. The error text, without the `Auto-compaction failed:` prefix of the event.
+- `tokensBefore`: Optional. The estimated context size when the compaction was attempted.
+- `contextWindow`, `threshold`: Optional. The model window and `contextWindow - reserveTokens`.
+- `attempt`: Optional. The attempt number, when the call site knows it.
+- `model`: Optional. `"provider/modelId"` of the summarizer.
+- `fromExtension`: Optional. `true` when an extension supplied the compaction content.
+
+Older Pi versions show nothing for this entry and load the file without error.
+
 ### CustomMessageEntry
 
 Extension-injected messages that DO participate in LLM context.

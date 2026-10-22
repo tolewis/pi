@@ -113,6 +113,34 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 }
 
+export type CompactionResultValidation = { ok: true } | { ok: false; errorMessage: string };
+
+/**
+ * Check a compaction result supplied by an extension before it is persisted.
+ * Extensions are untyped at runtime, so every field is checked by value.
+ */
+export function validateCompactionResult(
+	result: CompactionResult,
+	branchEntryIds: ReadonlySet<string>,
+): CompactionResultValidation {
+	if (typeof result.summary !== "string" || result.summary.trim() === "") {
+		return { ok: false, errorMessage: "Extension compaction result has an empty summary" };
+	}
+	if (typeof result.firstKeptEntryId !== "string" || !branchEntryIds.has(result.firstKeptEntryId)) {
+		return {
+			ok: false,
+			errorMessage: `Extension compaction result firstKeptEntryId ${JSON.stringify(result.firstKeptEntryId)} is not on the current branch`,
+		};
+	}
+	if (typeof result.tokensBefore !== "number" || !Number.isFinite(result.tokensBefore) || result.tokensBefore < 0) {
+		return {
+			ok: false,
+			errorMessage: `Extension compaction result tokensBefore ${String(result.tokensBefore)} is not a finite number >= 0`,
+		};
+	}
+	return { ok: true };
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -509,7 +537,9 @@ const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize
 Use this EXACT format:
 
 ## Goal
+Original request: "[The first user message of the conversation, quoted verbatim. Quote at most 2,000 characters and mark a cut with [...]. Never paraphrase it.]"
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+[If later messages changed the goal, add one line after the quote: Superseded by: <short text>]
 
 ## Constraints & Preferences
 - [Any constraints, preferences, or requirements mentioned by user]
@@ -544,11 +574,14 @@ const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summar
 - UPDATE "Next Steps" based on what was accomplished
 - PRESERVE exact file paths, function names, and error messages
 - If something is no longer relevant, you may remove it
+- KEEP the "Original request" quote under ## Goal verbatim. Never paraphrase or remove it
 
 Use this EXACT format:
 
 ## Goal
+Original request: "[Copy the original request quote from the previous summary verbatim. Never paraphrase or shorten it. If the previous summary has no quote, quote the first user message verbatim, at most 2,000 characters, and mark a cut with [...].]"
 [Preserve existing goals, add new ones if the task expanded]
+[If later messages changed the goal, keep or add one line after the quote: Superseded by: <short text>]
 
 ## Constraints & Preferences
 - [Preserve existing, add new ones discovered]
@@ -577,6 +610,16 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
+
+/** The summarizer returned no text, for example a reply with only thinking blocks. */
+export class EmptySummaryError extends Error {
+	readonly code = "empty_summary";
+
+	constructor(message: string) {
+		super(message);
+		this.name = "EmptySummaryError";
+	}
+}
 
 /**
  * Returns an error message when a summarization response cannot safely be persisted.
@@ -748,6 +791,10 @@ export async function generateSummaryWithUsage(
 	}
 
 	const textContent = contentText(response.content);
+	// A thinking-only reply has no text. Reject it before the caller appends file lists.
+	if (textContent.trim() === "") {
+		throw new EmptySummaryError("Summarization returned an empty summary");
+	}
 
 	return { text: textContent, usage: response.usage };
 }
@@ -791,14 +838,20 @@ function findProjectedCutPoint(
 	startIndex: number,
 	endIndex: number,
 	keepRecentTokens: number,
-): CutPointResult {
+): CutPointResult & { exceededBudget: boolean; hasCutPoints: boolean } {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
 		const entry = entries[i];
 		if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isCutPointMessage)) cutPoints.push(i);
 	}
 	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+		return {
+			firstKeptEntryIndex: startIndex,
+			turnStartIndex: -1,
+			isSplitTurn: false,
+			exceededBudget: false,
+			hasCutPoints: false,
+		};
 	}
 
 	let accumulatedTokens = 0;
@@ -853,15 +906,48 @@ function findProjectedCutPoint(
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
 		isSplitTurn: !startsTurn && turnStartIndex !== -1,
+		exceededBudget,
+		hasCutPoints: true,
 	};
 }
+
+/** Why `prepareCompaction()` returned undefined. */
+export type CompactionSkipReason = "kept_window_exceeds_threshold" | "nothing_to_summarize";
 
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
+	return prepareCompactionWithCutPoint(pathEntries, settings).preparation;
+}
+
+/**
+ * Same as `prepareCompaction()`, but report why nothing can be compacted.
+ * `kept_window_exceeds_threshold`: the context since the last compaction fits in
+ * `keepRecentTokens`, so the cut keeps everything. `nothing_to_summarize`: any other case, for
+ * example the last entry is a compaction or no message since it can start a kept range.
+ */
+export function prepareCompactionOrSkip(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+): { preparation: CompactionPreparation } | { skipReason: CompactionSkipReason } {
+	const { preparation, cutPoint } = prepareCompactionWithCutPoint(pathEntries, settings);
+	if (preparation) return { preparation };
+	return {
+		skipReason:
+			cutPoint?.hasCutPoints && !cutPoint.exceededBudget ? "kept_window_exceeds_threshold" : "nothing_to_summarize",
+	};
+}
+
+function prepareCompactionWithCutPoint(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+): {
+	preparation?: CompactionPreparation;
+	cutPoint?: CutPointResult & { exceededBudget: boolean; hasCutPoints: boolean };
+} {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
-		return undefined;
+		return {};
 	}
 
 	const projection = buildSessionProjection(pathEntries);
@@ -885,7 +971,7 @@ export function prepareCompaction(
 	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
 	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
-	if (!firstKeptEntry?.id) return undefined;
+	if (!firstKeptEntry?.id) return { cutPoint };
 	const firstKeptEntryId = firstKeptEntry.id;
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
@@ -898,7 +984,7 @@ export function prepareCompaction(
 				.flatMap(getMessagesFromProjectedEntryForCompaction)
 		: [];
 
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return { cutPoint };
 
 	// Extract file operations from edited model-visible messages and the previous compaction.
 	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
@@ -911,14 +997,17 @@ export function prepareCompaction(
 	}
 
 	return {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn: cutPoint.isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		fileOps,
-		settings,
+		cutPoint,
+		preparation: {
+			firstKeptEntryId,
+			messagesToSummarize,
+			turnPrefixMessages,
+			isSplitTurn: cutPoint.isSplitTurn,
+			tokensBefore,
+			previousSummary,
+			fileOps,
+			settings,
+		},
 	};
 }
 
@@ -1097,8 +1186,10 @@ async function generateTurnPrefixSummary(
 		throw new Error("Turn prefix summarization attempted to call a tool");
 	}
 
-	return {
-		text: contentText(response.content),
-		usage: response.usage,
-	};
+	const text = contentText(response.content);
+	if (text.trim() === "") {
+		throw new EmptySummaryError("Turn prefix summarization returned an empty summary");
+	}
+
+	return { text, usage: response.usage };
 }
