@@ -80,7 +80,7 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 
 `compaction.provider` and `compaction.model` can be set independently. An omitted component is inherited from the current session model. Explicit model settings must resolve to an existing model with auth. If the model is missing or has no auth, compaction fails with `Compaction model <provider/id> is not available: <why>`. It does not fall back to the session model.
 
-Choose a summary model whose context window can accommodate the history being summarized. Compaction does not split that history to fit a smaller summary model or automatically fall back to another model. Automatic compaction thresholds still use the session model's context window. If the summary model has a smaller window, increase `compaction.reserveTokens` (or its session-model override) to compact earlier.
+Automatic compaction thresholds use the session model's context window. If the compaction model differs from the session model and the summarizer input plus an 8192-token output allowance is greater than the compaction model's `contextWindow`, Pi summarizes with the session model and writes a `compaction_model_window` fallback record. Compaction does not split history to fit a smaller model. If the compaction model has a smaller window, increase `compaction.reserveTokens` (or its session-model override) to compact earlier. See [Compaction: Window-fit guard](compaction.md#window-fit-guard).
 
 <a id="per-model-compaction-overrides"></a>
 

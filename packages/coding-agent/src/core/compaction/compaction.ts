@@ -153,6 +153,12 @@ export class CompactionModelUnavailableError extends Error {
 // ============================================================================
 
 /**
+ * Output tokens reserved for the summary when a separate compaction model is checked for fit.
+ * The window-fit guard requires input + this allowance <= the compaction model's context window.
+ */
+export const SUMMARY_OUTPUT_ALLOWANCE_TOKENS = 8192;
+
+/**
  * Calculate total context tokens from usage.
  * Uses the native totalTokens field when available, falls back to computing from components.
  */
@@ -791,6 +797,18 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+}
+
+/**
+ * Estimate the tokens sent to the summarizer for a preparation (chars/4 heuristic).
+ * Counts the history, the split-turn prefix, and the previous summary. A split turn sends
+ * these in two requests, so the sum is an upper bound for each request.
+ */
+export function estimateSummarizationInputTokens(preparation: CompactionPreparation): number {
+	let tokens = Math.ceil((preparation.previousSummary?.length ?? 0) / 4);
+	for (const message of preparation.messagesToSummarize) tokens += estimateTokens(message);
+	for (const message of preparation.turnPrefixMessages) tokens += estimateTokens(message);
+	return tokens;
 }
 
 function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {

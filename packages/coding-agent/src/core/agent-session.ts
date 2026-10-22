@@ -73,9 +73,11 @@ import {
 	compact,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
+	estimateSummarizationInputTokens,
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	SUMMARY_OUTPUT_ALLOWANCE_TOKENS,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
@@ -2829,7 +2831,25 @@ export class AgentSession {
 		settings: { provider?: string; model?: string; thinkingLevel?: ThinkingLevel },
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
-		const summaryConfig = this._getSummarizationModel(settings, model, "compaction");
+		let summaryConfig = this._getSummarizationModel(settings, model, "compaction");
+		// Window-fit guard (#6442): a compaction model with a smaller window never gets input that cannot fit.
+		const compactionModel = summaryConfig.model;
+		if (model && (compactionModel.provider !== model.provider || compactionModel.id !== model.id)) {
+			const inputTokens = estimateSummarizationInputTokens(preparation);
+			const window = compactionModel.contextWindow;
+			if (window > 0 && inputTokens + SUMMARY_OUTPUT_ALLOWANCE_TOKENS > window) {
+				summaryConfig = this._getSummarizationModel({ thinkingLevel: settings.thinkingLevel }, model, "compaction");
+				this._recordCompactionModelWindowFallback({
+					trigger: reason,
+					outcome: "fallback",
+					reason: "compaction_model_window",
+					model: `${compactionModel.provider}/${compactionModel.id}`,
+					contextWindow: window,
+					tokensBefore: preparation.tokensBefore,
+					errorMessage: `${inputTokens} + ${SUMMARY_OUTPUT_ALLOWANCE_TOKENS} > ${window}`,
+				});
+			}
+		}
 		const request = await this._getCompactionRequestAuth(summaryConfig, signal);
 		return compact(
 			preparation,
@@ -2845,6 +2865,23 @@ export class AgentSession {
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
 		);
+	}
+
+	/**
+	 * Local hook for the C5 window-fit fallback record. Branch c1-c3 owns `_recordCompactionFailure`;
+	 * until that merge, this keeps the record shape and the single call site. TODO(c1 merge): call
+	 * `this._recordCompactionFailure(data)` here.
+	 */
+	private _recordCompactionModelWindowFallback(data: {
+		trigger: "manual" | "threshold" | "overflow";
+		outcome: "fallback";
+		reason: "compaction_model_window";
+		model: string;
+		contextWindow: number;
+		tokensBefore: number;
+		errorMessage: string;
+	}): void {
+		void data;
 	}
 
 	/**

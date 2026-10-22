@@ -463,3 +463,21 @@ Keys are exact, case-sensitive `provider/modelId` values, including any slashes 
 These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
 
 Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [Settings](settings.md#per-model-compaction-overrides) for details.
+
+### Compaction model
+
+`compaction.provider`, `compaction.model`, and `compaction.thinkingLevel` select the summarizer. A model override for the session model can set the same three fields. Each field resolves from the model override, then `compaction.*`, then the session model and thinking level. See [Settings: Compaction](settings.md#compaction).
+
+If the configured model is not in the model registry or has no auth, compaction fails with `Compaction model <provider/id> is not available: <why>`. Pi does not fall back to the session model in this case. Automatic compaction reports the error through `compaction_end` and leaves the context unchanged.
+
+#### Window-fit guard
+
+A compaction model with a smaller context window must never receive an input that cannot fit. This check runs only when the compaction model differs from the session model:
+
+1. Pi estimates the summarizer input with the chars/4 heuristic. The input is the history to summarize, the split-turn prefix, and the previous summary.
+2. Pi adds `SUMMARY_OUTPUT_ALLOWANCE_TOKENS` (8192) for the summary output.
+3. If the sum is greater than the compaction model's `contextWindow`, Pi summarizes with the session model instead.
+
+The fallback writes a compaction failure record with `outcome: "fallback"` and `reason: "compaction_model_window"`. The record names the compaction model, its window, and the comparison, for example `250000 + 8192 > 131072`. The compaction itself succeeds. To use the smaller model reliably, increase `compaction.reserveTokens` so that compaction starts earlier.
+
+Branch summaries do not need this guard. `generateBranchSummary` selects history to fit the window of the branch-summary model.
