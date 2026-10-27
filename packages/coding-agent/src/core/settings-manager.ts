@@ -869,6 +869,17 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
+	/** Newest turns whose tool results a prune keeps. Unset means the kept tail decides. */
+	getCompactionKeepRecentToolResults(): number | undefined {
+		const value = this.settings.compaction?.keepRecentToolResults;
+		if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) {
+			throw new Error(
+				`Invalid compaction.keepRecentToolResults setting: ${String(value)}. Expected a non-negative safe integer.`,
+			);
+		}
+		return value;
+	}
+
 	/** Resolve a summarizer field through the model override, then the ordinary setting. Unset means inherit. */
 	private getCompactionSummarizerSetting<K extends "provider" | "model" | "thinkingLevel">(
 		field: K,
@@ -889,6 +900,7 @@ export class SettingsManager {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		keepRecentToolResults?: number;
 		provider?: string;
 		model?: string;
 		thinkingLevel?: ThinkingLevel;
@@ -897,6 +909,7 @@ export class SettingsManager {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			keepRecentToolResults: this.getCompactionKeepRecentToolResults(),
 			provider: this.getCompactionSummarizerSetting("provider", model),
 			model: this.getCompactionSummarizerSetting("model", model),
 			thinkingLevel: this.getCompactionSummarizerSetting("thinkingLevel", model),

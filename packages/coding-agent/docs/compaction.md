@@ -40,6 +40,12 @@ A provider context-overflow error or an early final `stopReason: "length"` can s
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
+### Pruning old tool results
+
+Before an automatic compaction summarizes, Pi replaces tool results older than the kept tail with a one-line stub through a `context_edit` entry. The stub names the tool, the byte count, and the turn. The summarizer then reads the stubs instead of the full output. When the stubs alone bring the projected context under the threshold, Pi skips the summarizer and writes a compaction entry with `reason: "prune"` and `tokensAfter`. The conversation text stays in context. Only tool output is replaced, so a file read or a command can be repeated when its output is needed again.
+
+`compaction.keepRecentToolResults` sets how many of the newest turns keep their tool results in full. Unset, the kept tail of `keepRecentTokens` decides. A result whose stub would be longer than the result is left alone. Manual `/compact` does not prune.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards through the finalized session projection, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
@@ -192,7 +198,7 @@ interface CompactionEntry<T = unknown> {
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
   systemMessage?: SystemMessage; // prompt and tool state at the compaction boundary
-  reason?: "manual" | "threshold" | "overflow" | "extension"; // what started the compaction
+  reason?: "manual" | "threshold" | "overflow" | "extension" | "prune"; // what started the compaction
   tokensAfter?: number; // estimated context right after the compaction (chars/4)
 }
 

@@ -490,7 +490,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("notifies extensions when auto-compaction fails", async () => {
 		const failedEvents: Array<{
-			reason: "manual" | "threshold" | "overflow";
+			reason: "manual" | "threshold" | "overflow" | "prune";
 			errorMessage?: string;
 			aborted: boolean;
 			willRetry: boolean;
@@ -916,7 +916,9 @@ describe("AgentSession compaction characterization", () => {
 			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
 			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
-			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
+			// The oversized result crosses the threshold, so the summarizer runs first. A later check
+			// may prune the same result when the summary alone leaves the context over the threshold.
+			expect(harness.eventsOfType("compaction_start")[0]).toEqual({
 				type: "compaction_start",
 				reason: "threshold",
 			});

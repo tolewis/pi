@@ -74,6 +74,7 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Free context tokens below which automatic compaction starts. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
+| `compaction.keepRecentToolResults` | number | None | Newest turns whose tool results stay in full when a compaction prunes older results. Unset prunes the results outside the kept tail. |
 | `compaction.modelOverrides` | object | None | Per-model settings keyed by the exact session `provider/modelId`: `reserveTokens`, `keepRecentTokens`, `provider`, `model`, `thinkingLevel`. |
 | `compaction.provider` | string | current session provider | Provider used for compaction summaries. |
 | `compaction.model` | string | current session model | Model ID used for compaction summaries. |

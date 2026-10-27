@@ -87,6 +87,7 @@ import {
 	generateBranchSummary,
 	isCompactionFailureEntry,
 	prepareCompactionOrSkip,
+	pruneToolResults,
 	SUMMARY_OUTPUT_ALLOWANCE_TOKENS,
 	shouldCompact,
 	shouldRecordCompactionFailure,
@@ -223,13 +224,13 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" | "prune" }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: "manual" | "threshold" | "overflow" | "prune";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -396,6 +397,10 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const REPEAT_GUARD_LINE =
 	"This call repeats the previous call: same tool, same arguments, same output. To wait for a change, call wait with a predicate that exits 0 after the change.";
+
+/** Summary text of a compaction that pruned old tool results and needed no summarizer call. */
+const PRUNE_SUMMARY_NOTE =
+	"Older tool results were pruned to save context. Each one is replaced by a one-line stub that names the tool, the byte count, and the turn. Everything else in the conversation is kept in full.";
 
 /** Arguments in sorted key order, so two calls compare equal whatever their key order. */
 function stableArguments(value: unknown): string {
@@ -3516,6 +3521,25 @@ export class AgentSession {
 				return false;
 			}
 
+			const contextWindow = model?.contextWindow ?? 0;
+			const tokensBeforePrune = estimateProjectedContextTokens(
+				this.sessionManager.buildSessionProjection(),
+				this.sessionManager.getBranch(),
+			).tokens;
+			// Prune old tool results before any summarizer call. The stubs remove their bytes with no
+			// model call, and often bring the context back under the threshold on their own.
+			const prune = pruneToolResults(this.sessionManager, settings);
+			if (prune.pruned > 0) {
+				this._refreshFinalizedContext();
+				const tokensAfterPrune = estimateProjectedContextTokens(
+					this.sessionManager.buildSessionProjection(),
+					this.sessionManager.getBranch(),
+				).tokens;
+				if (contextWindow > 0 && !shouldCompact(tokensAfterPrune, contextWindow, settings)) {
+					return await this._runPruneCompaction(willRetry, tokensBeforePrune);
+				}
+			}
+
 			const pathEntries = this.sessionManager.getBranch();
 			const prepared = prepareCompactionOrSkip(pathEntries, settings);
 			if (!("preparation" in prepared)) {
@@ -3698,6 +3722,67 @@ export class AgentSession {
 			}
 			this._resolveIdleWaitIfIdle();
 		}
+	}
+
+	/**
+	 * Finish a compaction that pruned old tool results and no longer needs a summary. It writes a
+	 * compaction entry with `reason: "prune"`, so the session file records the prune and the next
+	 * request starts from the pruned projection.
+	 */
+	private async _runPruneCompaction(willRetry: boolean, tokensBefore: number): Promise<boolean> {
+		const pathEntries = this.sessionManager.getBranch();
+		const previousCompaction = pathEntries.findLast((entry): entry is CompactionEntry => entry.type === "compaction");
+		// Keep every entry the previous boundary kept, so the prune drops no conversation text.
+		const firstKeptEntryId = previousCompaction?.firstKeptEntryId ?? pathEntries[0]?.id ?? null;
+		// Carry the previous checkpoint forward, so the prune drops no summary text. The note is
+		// added once: a second prune compaction must not repeat it.
+		const previousSummary = previousCompaction?.summary;
+		const summary =
+			previousSummary === undefined
+				? PRUNE_SUMMARY_NOTE
+				: previousSummary.includes(PRUNE_SUMMARY_NOTE)
+					? previousSummary
+					: `${previousSummary}\n\n${PRUNE_SUMMARY_NOTE}`;
+
+		this._emit({ type: "compaction_start", reason: "prune" });
+		const tokensAfter = this._estimateTokensAfterCompaction(
+			this.sessionManager,
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+		);
+		const entryId = this.sessionManager.appendCompaction(
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+			undefined,
+			false,
+			undefined,
+			{ reason: "prune", ...(tokensAfter === undefined ? {} : { tokensAfter }) },
+		);
+		this._refreshFinalizedContext();
+
+		const savedCompactionEntry = this.sessionManager.getEntry(entryId);
+		if (savedCompactionEntry?.type === "compaction") {
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: savedCompactionEntry,
+				fromExtension: false,
+				reason: "prune",
+				willRetry,
+			});
+		}
+
+		const result: CompactionResult = {
+			summary,
+			firstKeptEntryId: firstKeptEntryId ?? entryId,
+			tokensBefore,
+			estimatedTokensAfter: estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages),
+		};
+		this._emit({ type: "compaction_end", reason: "prune", result, aborted: false, willRetry });
+
+		if (willRetry) return true;
+		return this.agent.hasQueuedMessages();
 	}
 
 	/**
