@@ -17,7 +17,7 @@ describe("per-result character budget", () => {
 		}
 	});
 
-	async function runTool(harness: Harness, toolName: string, args: Record<string, unknown>) {
+	async function runTool(harness: Harness, toolName: string, args: Record<string, string>) {
 		harness.setResponses([
 			fauxAssistantMessage([fauxToolCall(toolName, args)], { stopReason: "toolUse" }),
 			fauxAssistantMessage("done"),
@@ -75,7 +75,7 @@ describe("per-result character budget", () => {
 		expect(marker).not.toBeNull();
 		expect(text.length).toBeLessThanOrEqual(BUDGET + marker![0].length);
 		expect(text.startsWith("line 1 ")).toBe(true);
-		expect(text.endsWith("line 1000 " + "x".repeat(20))).toBe(true);
+		expect(text.endsWith(`line 1000 ${"x".repeat(20)}`)).toBe(true);
 		expect(readFileSync(marker![2], "utf-8")).toBe(content);
 	});
 
