@@ -3986,6 +3986,7 @@ export class AgentSession {
 		includeAllExtensionTools?: boolean;
 	}): void {
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
+		const maxResultChars = this.settingsManager.getMaxResultChars();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
 		const baseToolDefinitions = this._baseToolsOverride
@@ -3996,8 +3997,8 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					read: { autoResizeImages, maxResultChars },
+					bash: { commandPrefix: shellCommandPrefix, shellPath, maxResultChars },
 				});
 
 		this._baseToolDefinitions = new Map(

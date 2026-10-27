@@ -1364,6 +1364,19 @@ export class SettingsManager {
 		return this.settings.images?.autoResize ?? SETTINGS_DEFAULTS.images.autoResize;
 	}
 
+	getMaxResultChars(): number {
+		return this.settings.tools?.maxResultChars ?? SETTINGS_DEFAULTS.tools.maxResultChars;
+	}
+
+	setMaxResultChars(maxResultChars: number): void {
+		if (!this.globalSettings.tools) {
+			this.globalSettings.tools = {};
+		}
+		this.globalSettings.tools.maxResultChars = maxResultChars;
+		this.markModified("tools", "maxResultChars");
+		this.save();
+	}
+
 	setImageAutoResize(enabled: boolean): void {
 		if (!this.globalSettings.images) {
 			this.globalSettings.images = {};

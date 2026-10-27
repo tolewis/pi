@@ -5,11 +5,20 @@ import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import { writeOutputFile } from "../../utils/output-files.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import {
+	capResultChars,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	DEFAULT_MAX_RESULT_CHARS,
+	formatSize,
+	type TruncationResult,
+	truncateHead,
+} from "./truncate.ts";
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
@@ -67,6 +76,8 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Model-facing character budget for one result. Default: 20,000. The full text stays in a temp file. */
+	maxResultChars?: number;
 }
 
 /** The image block and its note, or the text for text files and images that could not be processed. */
@@ -89,11 +100,12 @@ export function createReadToolDefinition(
 ): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const fallbackResizeOptions = options?.resizeOptions;
+	const maxResultChars = options?.maxResultChars;
 	const ops = options?.operations ?? defaultReadOperations;
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) and capped at ${maxResultChars ?? DEFAULT_MAX_RESULT_CHARS} characters. Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		promptSnippet: readToolSystemPromptContribution.snippet,
 		promptGuidelines: [...readToolSystemPromptContribution.guidelines],
 		parameters: readSchema,
@@ -200,6 +212,14 @@ export function createReadToolDefinition(
 								} else {
 									// No truncation and no remaining user-limited content.
 									outputText = truncation.content;
+								}
+								if (maxResultChars !== undefined && outputText.length > maxResultChars) {
+									// Keep the head and the tail, and put the full text of this read in a temp file.
+									const fullOutputPath = await writeOutputFile("pi-read", ".txt", selectedContent);
+									outputText = capResultChars(outputText, {
+										maxChars: maxResultChars,
+										fullOutputPath,
+									}).content;
 								}
 								content = [{ type: "text", text: outputText }];
 							}

@@ -62,9 +62,13 @@ export {
 	type ReadToolOptions,
 } from "./read.ts";
 export {
+	capResultChars,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	DEFAULT_MAX_RESULT_CHARS,
 	formatSize,
+	type ResultCapOptions,
+	type ResultCapResult,
 	type TruncationOptions,
 	type TruncationResult,
 	truncateHead,

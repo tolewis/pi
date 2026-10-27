@@ -17,7 +17,13 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	DEFAULT_MAX_RESULT_CHARS,
+	formatSize,
+	type TruncationResult,
+} from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
@@ -222,6 +228,8 @@ export interface BashToolOptions {
 	exposeSessionEnvironment?: boolean;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+	/** Model-facing character budget for one result. Default: 20,000. The full output stays in a temp file. */
+	maxResultChars?: number;
 }
 
 export type BashRenderState = {
@@ -249,10 +257,11 @@ export function createShellToolDefinition(
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
+	const maxResultChars = options?.maxResultChars;
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) and capped at ${maxResultChars ?? DEFAULT_MAX_RESULT_CHARS} characters. If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
@@ -273,7 +282,7 @@ export function createShellToolDefinition(
 				exposeSessionEnvironment,
 				ctx,
 			);
-			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
+			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix, maxResultChars });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;
@@ -335,8 +344,14 @@ export function createShellToolDefinition(
 				return snapshot;
 			};
 
-			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
+			const formatOutput = async (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
+				const capped = await output.readCapped(maxResultChars ?? 0);
+				if (capped) {
+					// One marker line replaces the truncation notice. It gives the omitted byte count and
+					// the temp file with the full output, so the result stays within the budget.
+					return { text: capped.content, details: { truncation, fullOutputPath: snapshot.fullOutputPath } };
+				}
 				let text = snapshot.content || emptyText;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
@@ -370,7 +385,7 @@ export function createShellToolDefinition(
 					exitCode = result.exitCode;
 				} catch (err) {
 					const snapshot = await finishOutput();
-					const { text } = formatOutput(snapshot, "");
+					const { text } = await formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
@@ -382,7 +397,7 @@ export function createShellToolDefinition(
 				}
 
 				const snapshot = await finishOutput();
-				const { text: outputText, details } = formatOutput(snapshot);
+				const { text: outputText, details } = await formatOutput(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}

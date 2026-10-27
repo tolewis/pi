@@ -508,6 +508,18 @@
       },
       "description": "Initial tool selection. Plain names replace the inherited selection; +name and -name entries add or remove tools."
     },
+    "tools": {
+      "type": "object",
+      "properties": {
+        "maxResultChars": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 20000,
+          "description": "Maximum characters of one tool result that reach the model. The head and the tail are kept, with one marker line that gives the omitted byte count and the temp file holding the full output."
+        }
+      }
+    },
     "doubleEscapeAction": {
       "anyOf": [
         {
