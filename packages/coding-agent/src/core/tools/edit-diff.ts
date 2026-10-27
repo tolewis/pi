@@ -244,31 +244,150 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 	};
 }
 
-function countOccurrences(content: string, oldText: string): number {
-	const fuzzyContent = normalizeForFuzzyMatch(content);
-	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
-	return fuzzyContent.split(fuzzyOldText).length - 1;
+/** Line number (1-indexed) of the character at `index`. */
+function getLineNumberAt(content: string, index: number): number {
+	let line = 1;
+	for (let i = content.indexOf("\n"); i !== -1 && i < index; i = content.indexOf("\n", i + 1)) {
+		line++;
+	}
+	return line;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+/**
+ * Every non-overlapping occurrence of `oldText` in normalized space, with the line number of each.
+ * `lineNumbers` stops at `limit` entries; `total` counts them all.
+ */
+function findOccurrences(content: string, oldText: string, limit: number): { lineNumbers: number[]; total: number } {
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	const lineNumbers: number[] = [];
+	let total = 0;
+	if (fuzzyOldText.length === 0) {
+		return { lineNumbers, total };
+	}
+	for (
+		let index = fuzzyContent.indexOf(fuzzyOldText);
+		index !== -1;
+		index = fuzzyContent.indexOf(fuzzyOldText, index + fuzzyOldText.length)
+	) {
+		total++;
+		if (lineNumbers.length < limit) {
+			lineNumbers.push(getLineNumberAt(fuzzyContent, index));
+		}
+	}
+	return { lineNumbers, total };
+}
+
+/** Characters shared at the start and at the end of two lines, after trimming both. */
+function similarityScore(line: string, target: string): number {
+	const a = line.trim();
+	const b = target.trim();
+	if (a.length === 0 || b.length === 0) {
+		return 0;
+	}
+	let prefix = 0;
+	while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) {
+		prefix++;
+	}
+	let suffix = 0;
+	while (
+		suffix < a.length - prefix &&
+		suffix < b.length - prefix &&
+		a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+	) {
+		suffix++;
+	}
+	return prefix + suffix;
+}
+
+function boundLine(text: string, maxChars: number): string {
+	if (text.length <= maxChars) {
+		return text;
+	}
+	return `${text.slice(0, maxChars - 3)}...`;
+}
+
+/**
+ * The lines of `content` that most resemble the lines of `oldText`, up to `count` of them, each
+ * bounded to `maxChars`. Line numbers refer to `content`. Empty when nothing resembles the text.
+ */
+function getNearestLines(
+	content: string,
+	oldText: string,
+	count: number,
+	maxChars: number,
+): Array<{ line: number; text: string }> {
+	const rawLines = content.split("\n");
+	const scoringLines = normalizeForFuzzyMatch(content).split("\n");
+	const targets = normalizeForFuzzyMatch(oldText)
+		.split("\n")
+		.filter((line) => line.trim().length > 0);
+	if (targets.length === 0) {
+		return [];
+	}
+	const candidates: Array<{ line: number; text: string; score: number }> = [];
+	for (let index = 0; index < scoringLines.length; index++) {
+		let score = 0;
+		for (const target of targets) {
+			score = Math.max(score, similarityScore(scoringLines[index], target));
+		}
+		if (score > 0) {
+			candidates.push({ line: index + 1, text: boundLine(rawLines[index] ?? "", maxChars), score });
+		}
+	}
+	return candidates
+		.sort((a, b) => b.score - a.score || a.line - b.line)
+		.slice(0, count)
+		.sort((a, b) => a.line - b.line)
+		.map(({ line, text }) => ({ line, text }));
+}
+
+const NEAREST_LINE_COUNT = 3;
+const NEAREST_LINE_MAX_CHARS = 120;
+const DUPLICATE_LINE_LIMIT = 5;
+
+function formatNearestLines(content: string, oldText: string): string {
+	const nearest = getNearestLines(content, oldText, NEAREST_LINE_COUNT, NEAREST_LINE_MAX_CHARS);
+	if (nearest.length === 0) {
+		return "";
+	}
+	return `\nNearest lines:\n${nearest.map(({ line, text }) => `  ${line}: ${text}`).join("\n")}`;
+}
+
+function getNotFoundError(
+	path: string,
+	editIndex: number,
+	totalEdits: number,
+	content: string,
+	oldText: string,
+): Error {
+	const nearest = formatNearestLines(content, oldText);
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.${nearest}`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.${nearest}`,
 	);
 }
 
-function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {
+function getDuplicateError(
+	path: string,
+	editIndex: number,
+	totalEdits: number,
+	occurrences: number,
+	lineNumbers: number[],
+): Error {
+	const more = occurrences > lineNumbers.length ? ", ..." : "";
+	const lines = lineNumbers.length > 0 ? ` (lines ${lineNumbers.join(", ")}${more})` : "";
 	if (totalEdits === 1) {
 		return new Error(
-			`Found ${occurrences} occurrences of the text in ${path}. The text must be unique. Please provide more context to make it unique.`,
+			`Found ${occurrences} occurrences of the text in ${path}${lines}. The text must be unique. Please provide more context to make it unique.`,
 		);
 	}
 	return new Error(
-		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path}. Each oldText must be unique. Please provide more context to make it unique.`,
+		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path}${lines}. Each oldText must be unique. Please provide more context to make it unique.`,
 	);
 }
 
@@ -322,12 +441,16 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(path, i, normalizedEdits.length, replacementBaseContent, edit.oldText);
 		}
 
-		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
+		const { total: occurrences, lineNumbers } = findOccurrences(
+			replacementBaseContent,
+			edit.oldText,
+			DUPLICATE_LINE_LIMIT,
+		);
 		if (occurrences > 1) {
-			throw getDuplicateError(path, i, normalizedEdits.length, occurrences);
+			throw getDuplicateError(path, i, normalizedEdits.length, occurrences, lineNumbers);
 		}
 
 		matchedEdits.push({
