@@ -11,7 +11,7 @@ type SessionWithCompactionInternals = {
 
 interface RecordedCompactionEvent {
 	type: "session_before_compact" | "session_compact";
-	reason: "manual" | "threshold" | "overflow";
+	reason: "manual" | "threshold" | "overflow" | "prune";
 	willRetry: boolean;
 }
 

@@ -149,6 +149,8 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** Newest turns whose tool results stay in full when a prune runs. Unset uses the kept tail. */
+	keepRecentToolResults?: number;
 	provider?: string;
 	model?: string;
 	thinkingLevel?: ThinkingLevel;

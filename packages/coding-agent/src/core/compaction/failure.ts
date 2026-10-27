@@ -16,7 +16,7 @@ export const COMPACTION_FAILURE_CUSTOM_TYPE = "pi:compaction_failure";
 export const RESERVED_CUSTOM_TYPE_PREFIX = "pi:";
 
 /** What started the compaction. Same values as the existing compaction_start event `reason`. */
-export type CompactionTrigger = "manual" | "threshold" | "overflow" | "extension";
+export type CompactionTrigger = "manual" | "threshold" | "overflow" | "extension" | "prune";
 
 export type CompactionFailureOutcome =
 	| "error" // summarizer threw, provider error, handler threw, invalid result

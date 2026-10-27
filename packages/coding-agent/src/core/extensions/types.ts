@@ -799,8 +799,8 @@ export interface SessionCompactEvent {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	fromExtension: boolean;
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/** What triggered the compaction: manual /compact, the context threshold, context overflow recovery, or a tool-result prune */
+	reason: "manual" | "threshold" | "overflow" | "prune";
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 }
@@ -808,8 +808,8 @@ export interface SessionCompactEvent {
 /** Fired after context compaction fails or is aborted */
 export interface SessionCompactFailedEvent {
 	type: "session_compact_failed";
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/** What triggered the compaction: manual /compact, the context threshold, context overflow recovery, or a tool-result prune */
+	reason: "manual" | "threshold" | "overflow" | "prune";
 	/** Error text when compaction failed for a non-abort reason. */
 	errorMessage?: string;
 	/** True when compaction was cancelled or aborted. */

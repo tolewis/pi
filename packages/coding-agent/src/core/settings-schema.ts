@@ -25,6 +25,12 @@ const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	keepRecentToolResults: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Newest turns whose tool results stay in full when a compaction prunes older results. Unset prunes the results outside the kept tail.",
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
