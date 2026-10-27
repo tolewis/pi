@@ -198,6 +198,21 @@ Pi appends a custom entry with `customType` `pi:compaction_failure` when a compa
 
 Older Pi versions show nothing for this entry and load the file without error.
 
+#### Run ended mid-task record
+
+Pi appends a custom entry with `customType` `pi:run_ended_mid_task` when a run stops before the task does: the newest entry is a tool result with no follow-up assistant turn, an assistant turn with tool calls and no text, or an assistant turn with no text that stopped on `aborted`, `error`, or `length`. The entry is a record only. Pi does not retry the run because of it.
+
+```json
+{"type":"custom","id":"h9i0j1k3","parentId":"h9i0j1k2","timestamp":"2024-12-03T14:22:00.000Z","customType":"pi:run_ended_mid_task","data":{"reason":"aborted","stopReason":"aborted","pendingToolCall":true}}
+```
+
+`data` fields:
+- `reason`: `"aborted"`, `"error"`, `"length"`, or `"killed"`. `"killed"` means the loop stopped with no terminal stop reason, for example when the pane closed.
+- `stopReason`: Optional. The stop reason of the newest assistant message on the branch.
+- `pendingToolCall`: `true` when a tool result or a tool call has no follow-up assistant turn.
+
+Pi writes no record when the run will retry, and no record when the newest entry is an assistant turn with text. Older Pi versions show nothing for this entry and load the file without error.
+
 ### CustomMessageEntry
 
 Extension-injected messages that DO participate in LLM context.

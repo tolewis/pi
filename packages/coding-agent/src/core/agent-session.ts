@@ -136,6 +136,7 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
+import { detectRunEndedMidTask, RUN_ENDED_MID_TASK_CUSTOM_TYPE } from "./run-end.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	type BranchSummaryEntry,
@@ -1309,6 +1310,10 @@ export class AgentSession {
 		await this._emitExtensionEvent(event);
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
+		if (event.type === "agent_end") {
+			this._recordRunEndedMidTask(event);
+		}
+
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
@@ -1362,6 +1367,21 @@ export class AgentSession {
 			this._flushPendingCustomMessages();
 		}
 	};
+
+	/**
+	 * Append a durable `pi:run_ended_mid_task` record when the run stopped with a tool result or a
+	 * tool call that has no follow-up assistant turn. The record is information only: nothing retries.
+	 * A run that will retry has not ended, so it records nothing.
+	 */
+	private _recordRunEndedMidTask(event: Extract<AgentEvent, { type: "agent_end" }>): void {
+		if (this._willRetryAfterAgentEnd(event)) return;
+		const data = detectRunEndedMidTask(this.sessionManager.getBranch(), this._agentRunAbortRequested);
+		if (!data) return;
+		const entry = this.sessionManager.getEntry(
+			this.sessionManager.appendCustomEntry(RUN_ENDED_MID_TASK_CUSTOM_TYPE, data),
+		);
+		if (entry) this._emit({ type: "entry_appended", entry });
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
