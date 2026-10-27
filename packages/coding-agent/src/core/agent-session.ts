@@ -389,6 +389,40 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+/**
+ * One line added to the result of a tool call that repeats the previous call with the same output. It
+ * names the repeat and the tool that waits, so the model can stop polling by hand. A repeat that
+ * returned different output did real work, so it gets no line.
+ */
+const REPEAT_GUARD_LINE =
+	"This call repeats the previous call: same tool, same arguments, same output. To wait for a change, call wait with a predicate that exits 0 after the change.";
+
+/** Arguments in sorted key order, so two calls compare equal whatever their key order. */
+function stableArguments(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+	if (Array.isArray(value)) return `[${value.map(stableArguments).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+		left.localeCompare(right),
+	);
+	return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableArguments(entry)}`).join(",")}}`;
+}
+
+/** A tool call's name and arguments, as one comparable key. */
+function toolCallKey(name: string, args: unknown): string {
+	return `${name}\u0000${stableArguments(args)}`;
+}
+
+/** Add one text line to a tool result, after its last text part or as a new part. */
+function appendResultLine(content: Array<TextContent | ImageContent>, line: string): Array<TextContent | ImageContent> {
+	const last = content.at(-1);
+	if (last?.type === "text") {
+		const copy = content.slice();
+		copy[copy.length - 1] = { ...last, text: `${last.text}\n\n${line}` };
+		return copy;
+	}
+	return [...content, { type: "text", text: line }];
+}
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -452,6 +486,16 @@ export class AgentSession {
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
+
+	// Repeat guard state
+	/** Key of the previous tool call: name and arguments. */
+	private _lastToolCallKey: string | undefined;
+	/** Whether the previous tool call result was an error. */
+	private _lastToolCallWasError = false;
+	/** Text of the previous tool call result, to tell a poll from a repeat that did work. */
+	private _lastToolResultText: string | undefined;
+	/** Tool calls whose result carries the repeat line. */
+	private readonly _repeatGuardToolCallIds = new Set<string>();
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -718,6 +762,12 @@ export class AgentSession {
 		{ toolCall, args }: BeforeToolCallContext,
 		parentToolCallId?: string,
 	): Promise<BeforeToolCallResult | undefined> {
+		// A call that repeats the previous call, whose result was not an error, gets one line on its
+		// result. The line names the repeat and the wait tool. Nothing blocks and nothing retries.
+		if (this._lastToolCallKey === toolCallKey(toolCall.name, args) && !this._lastToolCallWasError) {
+			this._repeatGuardToolCallIds.add(toolCall.id);
+		}
+
 		const runner = this._extensionRunner;
 		if (!runner.hasHandlers("tool_call")) {
 			return undefined;
@@ -767,17 +817,27 @@ export class AgentSession {
 			autoResizeImages: this.settingsManager.getImageAutoResize(),
 			...(resizeOptions ? { resizeOptions } : {}),
 		});
+		const finalIsError = hookResult?.isError ?? isError;
+		const resultText = contentText(content);
+		const repeatedWithoutChange =
+			this._repeatGuardToolCallIds.delete(toolCall.id) && resultText === this._lastToolResultText;
+		const finalContent = repeatedWithoutChange
+			? appendResultLine(normalizedContent, REPEAT_GUARD_LINE)
+			: normalizedContent;
+		this._lastToolCallKey = toolCallKey(toolCall.name, args);
+		this._lastToolCallWasError = finalIsError;
+		this._lastToolResultText = resultText;
 
-		if (!hookResult && normalizedContent === content) {
+		if (!hookResult && finalContent === content) {
 			return undefined;
 		}
 
 		// The hook result already dropped structured content that replaced content no longer matches.
 		return {
-			content: normalizedContent,
+			content: finalContent,
 			details: hookResult?.details,
 			structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
-			isError: hookResult?.isError ?? isError,
+			isError: finalIsError,
 			usage: hookResult?.usage,
 		};
 	}
@@ -4047,7 +4107,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: [...DEFAULT_TOOL_NAMES];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
