@@ -39,11 +39,12 @@ See [Choose a Model](models.md) for model selection and thinking controls.
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `defaultTools` | `string[]` | `read`, `bash`, `edit`, `write` | Tools enabled at startup. Plain names replace the defaults; `+name` adds a tool and `-name` removes one. An empty array disables all built-in tools but not extension or SDK tools. |
+| `defaultTools` | `string[]` | `read`, `bash`, `edit`, `write`, `wait` | Tools enabled at startup. Plain names replace the defaults; `+name` adds a tool and `-name` removes one. An empty array disables all built-in tools but not extension or SDK tools. |
 | `codemode.mode` | `"on"` \| `"only"` | `"on"` | How the `codemode` tool presents tools while it is active. `on`: declared tools get a note on calling them from scripts appended to their description, and `codemode` lists only tools that are not declared. `only`: `codemode` lists every tool scripts can call, and active built-in and extension tools are hidden from the model, so it reaches them through `codemode`. |
 | `codemode.inlineBudget` | number | `3000` | Estimated tokens (characters / 4) the `codemode` tool's description may spend on tool declarations. Tools that do not fit are left out and found with `searchTools()`. `0` lists only namespaces. |
+| `tools.maxResultChars` | number | `20000` | Maximum characters of one `read`, `bash`, or `powershell` result that reach the model. Pi keeps the head and the tail, with one marker line that gives the omitted byte count and the temp file holding the full output. `0` turns the cap off. |
 
-Available built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, and `ls`. `defaultTools` can also name `codemode` and `tool_search`, which built-in extensions register inactive, and other extension tools registered inactive.
+Available built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, and `wait`. `defaultTools` can also name `codemode` and `tool_search`, which built-in extensions register inactive, and other extension tools registered inactive.
 
 A list of only `+name` and `-name` entries changes the inherited selection instead of replacing it. For example, this enables `codemode` next to the default tools:
 
@@ -73,11 +74,31 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Free context tokens below which automatic compaction starts. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
-| `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
+| `compaction.keepRecentToolResults` | number | None | Newest turns whose tool results stay in full when a compaction prunes older results. Unset prunes the results outside the kept tail. |
+| `compaction.modelOverrides` | object | None | Per-model settings keyed by the exact session `provider/modelId`: `reserveTokens`, `keepRecentTokens`, `provider`, `model`, `thinkingLevel`. |
+| `compaction.provider` | string | current session provider | Provider used for compaction summaries. |
+| `compaction.model` | string | current session model | Model ID used for compaction summaries. |
+| `compaction.thinkingLevel` | string | current session thinking level | Thinking level for compaction summaries: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
+
+`compaction.provider` and `compaction.model` can be set independently. An omitted component is inherited from the current session model. Explicit model settings must resolve to an existing model with auth. If the model is missing or has no auth, compaction fails with `Compaction model <provider/id> is not available: <why>`. It does not fall back to the session model.
+
+Automatic compaction thresholds use the session model's context window. If the compaction model differs from the session model and the summarizer input plus an 8192-token output allowance is greater than the compaction model's `contextWindow`, Pi summarizes with the session model and writes a `compaction_model_window` fallback record. Compaction does not split history to fit a smaller model. If the compaction model has a smaller window, increase `compaction.reserveTokens` (or its session-model override) to compact earlier. See [Compaction: Window-fit guard](compaction.md#window-fit-guard).
 
 <a id="per-model-compaction-overrides"></a>
 
 Compaction token values must be non-negative safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+
+`provider`, `model`, and `thinkingLevel` resolve the same way: the override for the session model, then `compaction.*`, then the session model and thinking level. For example, this keeps the session thinking level for every model except one local model, which summarizes with thinking off:
+
+```json
+{
+  "compaction": {
+    "modelOverrides": {
+      "vllm/qwen3-coder": { "thinkingLevel": "off" }
+    }
+  }
+}
+```
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 
@@ -87,6 +108,11 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 |---|---|---|---|
 | `branchSummary.reserveTokens` | number | `16384` | Tokens reserved when summarizing branch history. |
 | `branchSummary.skipPrompt` | boolean | `false` | Skip the branch-summary prompt and default to no summary. |
+| `branchSummary.provider` | string | current session provider | Provider used for branch summaries. |
+| `branchSummary.model` | string | current session model | Model ID used for branch summaries. |
+| `branchSummary.thinkingLevel` | string | current session thinking level | Thinking level for branch summaries: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
+
+`branchSummary.provider` and `branchSummary.model` can be set independently. An omitted component is inherited from the current session model. Explicit model settings must resolve to an existing model; invalid settings produce an error rather than falling back to the session model.
 
 ## Terminal and display
 

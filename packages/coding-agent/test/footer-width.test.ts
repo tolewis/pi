@@ -26,6 +26,7 @@ function createSession(options: {
 	toolUsage?: AssistantUsage;
 	usingSubscription?: boolean;
 	routedModel?: { model: { id: string }; thinkingLevel?: string };
+	compactionPausedFailures?: number;
 }): AgentSession {
 	const usage = options.usage;
 	const entries: Array<Record<string, unknown>> = [];
@@ -83,6 +84,10 @@ function createSession(options: {
 			getCwd: () => "/tmp/project",
 		},
 		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
+		compactionBackoff: {
+			consecutiveFailures: options.compactionPausedFailures ?? 0,
+			paused: options.compactionPausedFailures !== undefined,
+		},
 		routedModel: options.routedModel,
 		modelRuntime: {
 			isUsingSubscription: () => options.usingSubscription ?? false,
@@ -208,6 +213,21 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("$1.250");
+	});
+
+	it("shows paused auto-compaction only while auto-compaction is enabled", () => {
+		const session = createSession({ sessionName: "paused", compactionPausedFailures: 3 });
+		const footer = new FooterComponent(session, createFooterData(1));
+		expect(stripAnsi(footer.render(200).join("\n"))).toContain("auto-compaction paused (3 failures)");
+
+		footer.setAutoCompactEnabled(false);
+		footer.invalidate();
+		expect(stripAnsi(footer.render(200).join("\n"))).not.toContain("auto-compaction paused");
+		expect(
+			stripAnsi(
+				new FooterComponent(createSession({ sessionName: "ok" }), createFooterData(1)).render(200).join("\n"),
+			),
+		).not.toContain("auto-compaction paused");
 	});
 
 	it("updates cached usage totals after an entry is appended", () => {

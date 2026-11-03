@@ -50,10 +50,13 @@ export type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+
+type CompactionTokenField = "reserveTokens" | "keepRecentTokens";
+
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<Pick<CompactionModelOverride, CompactionTokenField>> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
@@ -82,7 +85,7 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 }
 
 /** Tools enabled at startup when `defaultTools` does not change them. */
-export const DEFAULT_TOOL_NAMES: readonly string[] = ["read", "bash", "edit", "write"];
+export const DEFAULT_TOOL_NAMES: readonly string[] = ["read", "bash", "edit", "write", "wait"];
 
 /** Whether a tool selection entry is a `+name` or `-name` modifier. */
 export function isToolModifier(entry: unknown): boolean {
@@ -844,7 +847,7 @@ export class SettingsManager {
 	}
 
 	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
+		field: CompactionTokenField,
 		model?: Pick<Model<string>, "provider" | "id">,
 	): number {
 		const compaction = this.settings.compaction;
@@ -879,28 +882,88 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Newest turns whose tool results a prune keeps. Unset means the kept tail decides. */
+	getCompactionKeepRecentToolResults(): number | undefined {
+		const value = this.settings.compaction?.keepRecentToolResults;
+		if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) {
+			throw new Error(
+				`Invalid compaction.keepRecentToolResults setting: ${String(value)}. Expected a non-negative safe integer.`,
+			);
+		}
+		return value;
+	}
+
+	/** Resolve a summarizer field through the model override, then the ordinary setting. Unset means inherit. */
+	private getCompactionSummarizerSetting<K extends "provider" | "model" | "thinkingLevel">(
+		field: K,
+		model?: Pick<Model<string>, "provider" | "id">,
+	): CompactionModelOverride[K] {
+		const compaction = this.settings.compaction;
+		const entry = model ? compaction?.modelOverrides?.[`${model.provider}/${model.id}`] : undefined;
+		const override = isMergeableObject(entry) ? entry[field] : undefined;
+		return override ?? compaction?.[field];
+	}
+
+	/**
+	 * Resolve each token setting through model override, ordinary setting, then built-in default.
+	 * Summarizer `provider`, `model`, and `thinkingLevel` resolve through model override, then
+	 * ordinary setting; undefined means inherit from the session.
+	 */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		keepRecentToolResults?: number;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: ThinkingLevel;
 	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			keepRecentToolResults: this.getCompactionKeepRecentToolResults(),
+			provider: this.getCompactionSummarizerSetting("provider", model),
+			model: this.getCompactionSummarizerSetting("model", model),
+			thinkingLevel: this.getCompactionSummarizerSetting("thinkingLevel", model),
 		};
 	}
 
-	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
+	getBranchSummarySettings(): {
+		reserveTokens: number;
+		skipPrompt: boolean;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: ThinkingLevel;
+	} {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? SETTINGS_DEFAULTS.branchSummary.reserveTokens,
 			skipPrompt: this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt,
+			provider: this.settings.branchSummary?.provider,
+			model: this.settings.branchSummary?.model,
+			thinkingLevel: this.settings.branchSummary?.thinkingLevel,
 		};
 	}
 
 	getBranchSummarySkipPrompt(): boolean {
 		return this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt;
+	}
+
+	setSummarizationConfig(
+		settingsKey: "compaction" | "branchSummary",
+		provider: string,
+		model: string,
+		thinkingLevel: ThinkingLevel,
+	): void {
+		const settings = this.globalSettings[settingsKey] ?? {};
+		this.globalSettings[settingsKey] = settings;
+		settings.provider = provider;
+		settings.model = model;
+		settings.thinkingLevel = thinkingLevel;
+		this.markModified(settingsKey, "provider");
+		this.markModified(settingsKey, "model");
+		this.markModified(settingsKey, "thinkingLevel");
+		this.save();
 	}
 
 	getRetryEnabled(): boolean {
@@ -1325,6 +1388,19 @@ export class SettingsManager {
 
 	getImageAutoResize(): boolean {
 		return this.settings.images?.autoResize ?? SETTINGS_DEFAULTS.images.autoResize;
+	}
+
+	getMaxResultChars(): number {
+		return this.settings.tools?.maxResultChars ?? SETTINGS_DEFAULTS.tools.maxResultChars;
+	}
+
+	setMaxResultChars(maxResultChars: number): void {
+		if (!this.globalSettings.tools) {
+			this.globalSettings.tools = {};
+		}
+		this.globalSettings.tools.maxResultChars = maxResultChars;
+		this.markModified("tools", "maxResultChars");
+		this.save();
 	}
 
 	setImageAutoResize(enabled: boolean): void {

@@ -12,7 +12,12 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import {
+	COMPACTION_FAILURE_CUSTOM_TYPE,
+	type CompactionFailureData,
+	estimateTokens,
+	isCompactionFailureEntry,
+} from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -57,12 +62,12 @@ function createAssistant(
 function useSummaryStreamFn(
 	harness: Harness,
 	summary: string,
-	onRequest?: (context: TranscriptContext, options: SimpleStreamOptions | undefined) => void,
+	onRequest?: (context: TranscriptContext, options: SimpleStreamOptions | undefined, model: Model<string>) => void,
 ): () => number {
 	let callCount = 0;
 	harness.session.agent.streamFunction = (model, context, options) => {
 		callCount++;
-		onRequest?.(context, options);
+		onRequest?.(context, options, model);
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
 			const message: AssistantMessage = {
@@ -77,6 +82,10 @@ function useSummaryStreamFn(
 		return stream;
 	};
 	return () => callCount;
+}
+
+function getFailureRecords(harness: Harness): CompactionFailureData[] {
+	return harness.sessionManager.getBranch().flatMap((entry) => (isCompactionFailureEntry(entry) ? [entry.data] : []));
 }
 
 function seedCompactableSession(harness: Harness): void {
@@ -379,6 +388,90 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
+	it("uses configured compaction model and thinking level with the session provider", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-summary", reasoning: true }],
+			settings: {
+				compaction: { keepRecentTokens: 1, model: "faux-summary", thinkingLevel: "high" },
+			},
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const calls: Array<{ modelId: string; reasoning: SimpleStreamOptions["reasoning"] }> = [];
+		useSummaryStreamFn(harness, "summary from configured model", (_context, options, model) => {
+			calls.push({ modelId: model.id, reasoning: options?.reasoning });
+		});
+
+		const result = await harness.session.compact();
+
+		expect(result.summary).toContain("summary from configured model");
+		expect(calls).toEqual([{ modelId: "faux-summary", reasoning: "high" }]);
+	});
+
+	it.each([
+		{ thinkingLevel: undefined, reasoning: "medium" },
+		{ thinkingLevel: "high", reasoning: "high" },
+		{ thinkingLevel: "off", reasoning: undefined },
+		{ thinkingLevel: "max", reasoning: "high" },
+	] as const)(
+		"uses configured manual compaction model and thinking without mutation: $thinkingLevel",
+		async ({ thinkingLevel, reasoning }) => {
+			const harness = await createHarness({
+				models: [
+					{ id: "faux-1", reasoning: true },
+					{ id: "faux-configured", reasoning: true },
+				],
+				settings: {
+					compaction: { keepRecentTokens: 1, model: "faux-configured", thinkingLevel },
+				},
+			});
+			harnesses.push(harness);
+			harness.session.agent.state.thinkingLevel = "medium";
+			seedCompactableSession(harness);
+			const mainModel = harness.session.model;
+			const mainThinkingLevel = harness.session.thinkingLevel;
+			const settingsBefore = {
+				compaction: harness.settingsManager.getCompactionSettings(),
+				defaultProvider: harness.settingsManager.getDefaultProvider(),
+				defaultModel: harness.settingsManager.getDefaultModel(),
+				defaultThinkingLevel: harness.settingsManager.getDefaultThinkingLevel(),
+			};
+			const calls: Array<{ modelId: string; reasoning: SimpleStreamOptions["reasoning"] }> = [];
+			useSummaryStreamFn(harness, "configured summary", (_context, options, model) => {
+				calls.push({ modelId: model.id, reasoning: options?.reasoning });
+			});
+
+			const result = await harness.session.compact();
+
+			expect(result.summary).toContain("configured summary");
+			expect(calls).toEqual([{ modelId: "faux-configured", reasoning }]);
+			expect(harness.session.model).toBe(mainModel);
+			expect(harness.session.thinkingLevel).toBe(mainThinkingLevel);
+			expect({
+				compaction: harness.settingsManager.getCompactionSettings(),
+				defaultProvider: harness.settingsManager.getDefaultProvider(),
+				defaultModel: harness.settingsManager.getDefaultModel(),
+				defaultThinkingLevel: harness.settingsManager.getDefaultThinkingLevel(),
+			}).toEqual(settingsBefore);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "model_change" || entry.type === "thinking_level_change"),
+			).toHaveLength(0);
+		},
+	);
+
+	it("points to the relevant settings when a summarization model is not found", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { provider: "missing-provider" } },
+		});
+		harnesses.push(harness);
+
+		await expect(harness.session.compact()).rejects.toThrow(
+			"Compaction model missing-provider/faux-1 is not available: not found in the model registry. Check compaction.provider and compaction.model in your settings.",
+		);
+	});
+
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
@@ -397,7 +490,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("notifies extensions when auto-compaction fails", async () => {
 		const failedEvents: Array<{
-			reason: "manual" | "threshold" | "overflow";
+			reason: "manual" | "threshold" | "overflow" | "prune";
 			errorMessage?: string;
 			aborted: boolean;
 			willRetry: boolean;
@@ -437,7 +530,291 @@ describe("AgentSession compaction characterization", () => {
 				errorMessage: "Auto-compaction failed: summary generator blew up",
 			}),
 		]);
+		const model = harness.getModel();
+		const newest = harness.sessionManager.getBranch().at(-1);
+		expect(newest).toMatchObject({ type: "custom", customType: COMPACTION_FAILURE_CUSTOM_TYPE });
+		expect(harness.eventsOfType("entry_appended").at(-1)?.entry).toBe(newest);
+		expect(getFailureRecords(harness)).toEqual([
+			{
+				trigger: "threshold",
+				outcome: "error",
+				attempt: 1,
+				reason: "summarizer_error",
+				errorMessage: "summary generator blew up",
+				tokensBefore: expect.any(Number),
+				contextWindow: model.contextWindow,
+				threshold: model.contextWindow - harness.settingsManager.getCompactionSettings(model).reserveTokens,
+				model: `${model.provider}/${model.id}`,
+			},
+		]);
+		// The record is not model context.
+		expect(harness.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+		]);
 	});
+
+	it("takes the failure reason and model from a coded error", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = () => {
+			throw Object.assign(new Error("compaction model has no auth"), {
+				code: "compaction_model_unavailable",
+				model: "other/summarizer",
+			});
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "next request" }],
+			timestamp: Date.now(),
+		});
+		await expect(harness.session.compact()).rejects.toThrow("compaction model has no auth");
+
+		expect(getFailureRecords(harness)).toEqual([
+			expect.objectContaining({
+				trigger: "threshold",
+				reason: "compaction_model_unavailable",
+				model: "other/summarizer",
+			}),
+			expect.objectContaining({
+				trigger: "manual",
+				reason: "compaction_model_unavailable",
+				model: "other/summarizer",
+			}),
+		]);
+	});
+
+	it("records one failure per check cluster and a new one after a user message", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = () => {
+			throw new Error("summary generator blew up");
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+		await sessionInternals._runAutoCompaction("threshold", false);
+		expect(getFailureRecords(harness)).toHaveLength(1);
+		// The second attempt still notifies listeners.
+		expect(harness.eventsOfType("compaction_end").filter((event) => event.errorMessage)).toHaveLength(2);
+
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "next request" }],
+			timestamp: Date.now(),
+		});
+		await sessionInternals._runAutoCompaction("threshold", false);
+		expect(getFailureRecords(harness)).toHaveLength(2);
+	});
+
+	it("records a skipped auto-compaction when the kept window covers the context", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 2000, keepRecentTokens: 50_000 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
+
+		await harness.session.prompt(`first ${"x".repeat(30_000)}`);
+		expect(harness.eventsOfType("compaction_start")).toEqual([]);
+		expect(getFailureRecords(harness)).toEqual([
+			{
+				trigger: "threshold",
+				outcome: "skipped",
+				reason: "kept_window_exceeds_threshold",
+				errorMessage: "keepRecentTokens (50000) keeps all context since the last compaction",
+				tokensBefore: expect.any(Number),
+				contextWindow: 10_000,
+				threshold: 8000,
+				model: "faux/faux-1",
+			},
+		]);
+		expect(getFailureRecords(harness)[0]?.tokensBefore).toBeGreaterThan(8000);
+
+		// The next prompt checks again before and after its run: one record per episode.
+		await harness.session.prompt("second");
+		expect(getFailureRecords(harness)).toHaveLength(2);
+		const branch = harness.sessionManager.getBranch();
+		const secondUser = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(branch.slice(secondUser).filter(isCompactionFailureEntry)).toHaveLength(1);
+	});
+
+	it("records skipped with nothing_to_summarize right after a compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		useSummaryStreamFn(harness, "summary");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await harness.session.compact();
+		await sessionInternals._runAutoCompaction("threshold", false);
+		await sessionInternals._runAutoCompaction("threshold", false);
+
+		expect(getFailureRecords(harness)).toEqual([
+			expect.objectContaining({ trigger: "threshold", outcome: "skipped", reason: "nothing_to_summarize" }),
+		]);
+	});
+
+	it("records a cancelled auto-compaction", async () => {
+		const { harness, compactionStarted } = await createAbortableCompactionHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		const compaction = sessionInternals._runAutoCompaction("threshold", false);
+		await compactionStarted;
+		harness.session.abortCompaction();
+		await expect(compaction).resolves.toBe(false);
+
+		expect(getFailureRecords(harness)).toEqual([
+			expect.objectContaining({ trigger: "threshold", outcome: "cancelled", reason: "cancelled" }),
+		]);
+		expect(getFailureRecords(harness)[0]?.errorMessage).toBeUndefined();
+	});
+
+	it("records manual compaction failures and keeps the already-compacted error", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = () => {
+			throw new Error("summary generator blew up");
+		};
+
+		await expect(harness.session.compact()).rejects.toThrow("summary generator blew up");
+		expect(getFailureRecords(harness)).toEqual([
+			expect.objectContaining({
+				trigger: "manual",
+				outcome: "error",
+				reason: "summarizer_error",
+				errorMessage: "summary generator blew up",
+			}),
+		]);
+
+		useSummaryStreamFn(harness, "summary");
+		await harness.session.compact();
+		await expect(harness.session.compact()).rejects.toThrow("Already compacted");
+		// The failure record after the compaction does not change the error.
+		await expect(harness.session.compact()).rejects.toThrow("Already compacted");
+		expect(getFailureRecords(harness).slice(1)).toEqual([
+			expect.objectContaining({ trigger: "manual", outcome: "skipped", reason: "nothing_to_summarize" }),
+		]);
+	});
+
+	it("auto-compacts with the configured summarization model when the session model is absent", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-summary" }],
+			settings: { compaction: { keepRecentTokens: 1, provider: "faux", model: "faux-summary" } },
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.state.model = undefined as unknown as Model<string>;
+		const getStreamCallCount = useSummaryStreamFn(harness, "summary without session model");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+
+		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(compactionEntries).toHaveLength(1);
+		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("uses configured branch summary model and thinking level", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1" }, { id: "faux-branch-summary", reasoning: true }],
+			settings: {
+				branchSummary: { provider: "faux", model: "faux-branch-summary", thinkingLevel: "medium" },
+			},
+		});
+		harnesses.push(harness);
+		const rootId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "root" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "branch work" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage(createAssistant(harness, { stopReason: "stop", totalTokens: 10 }));
+		const calls: Array<{ modelId: string; reasoning: SimpleStreamOptions["reasoning"] }> = [];
+		harness.session.agent.state.model = undefined as unknown as Model<string>;
+		useSummaryStreamFn(harness, "branch summary from configured model", (_context, options, model) => {
+			calls.push({ modelId: model.id, reasoning: options?.reasoning });
+		});
+
+		const result = await harness.session.navigateTree(rootId, { summarize: true });
+
+		expect(result.summaryEntry?.summary).toContain("branch summary from configured model");
+		expect(calls).toEqual([{ modelId: "faux-branch-summary", reasoning: "medium" }]);
+	});
+
+	it.each([
+		{ thinkingLevel: undefined, reasoning: "medium" },
+		{ thinkingLevel: "high", reasoning: "high" },
+		{ thinkingLevel: "off", reasoning: undefined },
+		{ thinkingLevel: "max", reasoning: "high" },
+	] as const)(
+		"uses configured branch summary model and thinking without mutation: $thinkingLevel",
+		async ({ thinkingLevel, reasoning }) => {
+			const harness = await createHarness({
+				models: [
+					{ id: "faux-1", reasoning: true },
+					{ id: "faux-configured", reasoning: true },
+				],
+				settings: {
+					branchSummary: { provider: "faux", model: "faux-configured", thinkingLevel },
+				},
+			});
+			harnesses.push(harness);
+			harness.session.agent.state.thinkingLevel = "medium";
+			const rootId = harness.sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "root" }],
+				timestamp: Date.now(),
+			});
+			harness.sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "branch work" }],
+				timestamp: Date.now(),
+			});
+			harness.sessionManager.appendMessage(createAssistant(harness, { stopReason: "stop", totalTokens: 10 }));
+			const mainModel = harness.session.model;
+			const mainThinkingLevel = harness.session.thinkingLevel;
+			const settingsBefore = {
+				branchSummary: harness.settingsManager.getBranchSummarySettings(),
+				defaultProvider: harness.settingsManager.getDefaultProvider(),
+				defaultModel: harness.settingsManager.getDefaultModel(),
+				defaultThinkingLevel: harness.settingsManager.getDefaultThinkingLevel(),
+			};
+			const calls: Array<{ modelId: string; reasoning: SimpleStreamOptions["reasoning"] }> = [];
+			useSummaryStreamFn(harness, "branch summary from configured model", (_context, options, model) => {
+				calls.push({ modelId: model.id, reasoning: options?.reasoning });
+			});
+
+			const result = await harness.session.navigateTree(rootId, { summarize: true });
+
+			expect(result.summaryEntry?.summary).toContain("branch summary from configured model");
+			expect(calls).toEqual([{ modelId: "faux-configured", reasoning }]);
+			expect(harness.session.model).toBe(mainModel);
+			expect(harness.session.thinkingLevel).toBe(mainThinkingLevel);
+			expect({
+				branchSummary: harness.settingsManager.getBranchSummarySettings(),
+				defaultProvider: harness.settingsManager.getDefaultProvider(),
+				defaultModel: harness.settingsManager.getDefaultModel(),
+				defaultThinkingLevel: harness.settingsManager.getDefaultThinkingLevel(),
+			}).toEqual(settingsBefore);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "model_change" || entry.type === "thinking_level_change"),
+			).toHaveLength(0);
+		},
+	);
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
 		const harness = await createHarness({
@@ -539,7 +916,9 @@ describe("AgentSession compaction characterization", () => {
 			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
 			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
-			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
+			// The oversized result crosses the threshold, so the summarizer runs first. A later check
+			// may prune the same result when the summary alone leaves the context over the threshold.
+			expect(harness.eventsOfType("compaction_start")[0]).toEqual({
 				type: "compaction_start",
 				reason: "threshold",
 			});
@@ -826,6 +1205,15 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionErrors).toContain(
 			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
 		);
+		expect(getFailureRecords(harness)).toEqual([
+			expect.objectContaining({
+				trigger: "overflow",
+				outcome: "error",
+				reason: "overflow_recovery_exhausted",
+				errorMessage:
+					"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+			}),
+		]);
 	});
 
 	it("compacts successful overflow responses without retrying", async () => {

@@ -61,7 +61,7 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 	return {
 		customPrompt: input.customPrompt,
 		forceSystemPrompt: input.forceSystemPrompt,
-		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
+		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write", "wait"])],
 		hiddenTools: [...(input.hiddenTools ?? [])],
 		toolSnippets: { ...(input.toolSnippets ?? {}) },
 		toolGuidelines: Object.fromEntries(

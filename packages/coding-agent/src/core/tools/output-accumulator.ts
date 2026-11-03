@@ -1,11 +1,19 @@
 import type { WriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { createOutputFileStream } from "../../utils/output-files.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatOmittedMarker,
+	type TruncationResult,
+	truncateTail,
+} from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
 	maxLines?: number;
 	maxBytes?: number;
+	/** Model-facing character budget. The full output is kept in a temp file when it is exceeded. */
+	maxResultChars?: number;
 	tempFilePrefix?: string;
 }
 
@@ -25,6 +33,11 @@ function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
 
+function isLowSurrogateAt(text: string, index: number): boolean {
+	const code = text.charCodeAt(index);
+	return code >= 0xdc00 && code <= 0xdfff;
+}
+
 /**
  * Incrementally tracks streaming output with bounded memory.
  *
@@ -36,6 +49,7 @@ export class OutputAccumulator {
 	private readonly maxLines: number;
 	private readonly maxBytes: number;
 	private readonly maxRollingBytes: number;
+	private readonly maxResultChars: number | undefined;
 	private readonly tempFilePrefix: string;
 	private readonly decoder = new TextDecoder();
 
@@ -58,6 +72,7 @@ export class OutputAccumulator {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 		this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 		this.maxRollingBytes = Math.max(this.maxBytes * 2, 1);
+		this.maxResultChars = options.maxResultChars;
 		this.tempFilePrefix = options.tempFilePrefix ?? "pi-output";
 	}
 
@@ -179,6 +194,50 @@ export class OutputAccumulator {
 		return this.currentLineBytes;
 	}
 
+	/** The first `maxBytes` bytes of the output, decoded up to the last complete character. */
+	async readHead(maxBytes: number): Promise<string> {
+		if (!this.tempFilePath) {
+			const buffer = Buffer.concat(this.rawChunks);
+			return new TextDecoder().decode(buffer.subarray(0, Math.max(0, maxBytes)), { stream: true });
+		}
+		const file = await open(this.tempFilePath, "r");
+		try {
+			const size = (await file.stat()).size;
+			const length = Math.min(size, Math.max(0, maxBytes));
+			const head = Buffer.alloc(length);
+			await file.read(head, 0, length, 0);
+			return new TextDecoder().decode(head, { stream: true });
+		} finally {
+			await file.close();
+		}
+	}
+
+	/**
+	 * The model-facing content under a character budget: the head and the tail of the full output with
+	 * one marker line between them. Returns `undefined` when the output already fits. Call after
+	 * `finish()` and `closeTempFile()`.
+	 */
+	async readCapped(maxChars: number): Promise<{ content: string; omittedBytes: number } | undefined> {
+		if (maxChars <= 0 || this.totalDecodedBytes <= maxChars) {
+			return undefined;
+		}
+		// Two newlines separate the head, the marker line, and the tail, so they come out of the budget.
+		const budget = Math.max(1, maxChars - 2);
+		const head = await this.readHead(Math.floor(budget / 2));
+		const tailChars = Math.max(0, budget - head.length);
+		const snapshotText = this.getSnapshotText();
+		let tailStart = Math.max(0, snapshotText.length - tailChars);
+		if (tailStart > 0 && isLowSurrogateAt(snapshotText, tailStart)) {
+			tailStart++;
+		}
+		const tail = snapshotText.slice(tailStart);
+		const omittedBytes = Math.max(0, this.totalDecodedBytes - byteLength(head) - byteLength(tail));
+		return {
+			content: `${head}\n${formatOmittedMarker(omittedBytes, this.tempFilePath)}\n${tail}`,
+			omittedBytes,
+		};
+	}
+
 	private appendDecodedText(text: string): void {
 		if (text.length === 0) {
 			return;
@@ -237,8 +296,12 @@ export class OutputAccumulator {
 	}
 
 	private shouldUseTempFile(): boolean {
+		const overResultBudget = this.maxResultChars !== undefined && this.totalDecodedBytes > this.maxResultChars;
 		return (
-			this.totalRawBytes > this.maxBytes || this.totalDecodedBytes > this.maxBytes || this.totalLines > this.maxLines
+			overResultBudget ||
+			this.totalRawBytes > this.maxBytes ||
+			this.totalDecodedBytes > this.maxBytes ||
+			this.totalLines > this.maxLines
 		);
 	}
 

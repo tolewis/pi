@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
+import { formatCompactionFailure, isCompactionFailureEntry } from "../core/compaction/failure.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
@@ -108,6 +109,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe = session.subscribe((event) => {
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+				// Also on stderr, so a pane that keeps only stderr logs keeps the failure.
+				if (event.type === "entry_appended" && isCompactionFailureEntry(event.entry)) {
+					process.stderr.write(`[pi] ${formatCompactionFailure(event.entry.data)}\n`);
+				}
 			}
 		});
 		unsubscribeBackpressure =
