@@ -55,7 +55,6 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - When regressions tests for fixing a github issue, add a comment with the github issue number next to the test.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
-- Never commit unless the user asks.
 
 ## Dependency and Install Security
 
@@ -139,4 +138,4 @@ For release preparation, publishing, verification, or recovery, load and follow 
 
 ## User Override
 
-If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.
+If the user's instructions conflict with any rule in this document, the user's instructions win.
