@@ -164,6 +164,10 @@
                 },
                 "thinkingLevel": {
                   "$ref": "#/$defs/ModelThinkingLevel"
+                },
+                "pruneToolResults": {
+                  "type": "boolean",
+                  "description": "False: compaction never prunes old tool results for this model and always summarizes. Each prune rewrites the prompt, so a server that keeps prompt states reads the whole prompt again. Unset means true."
                 }
               }
             }

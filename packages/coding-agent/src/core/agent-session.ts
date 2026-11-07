@@ -3549,7 +3549,10 @@ export class AgentSession {
 			).tokens;
 			// Prune old tool results before any summarizer call. The stubs remove their bytes with no
 			// model call, and often bring the context back under the threshold on their own.
-			const prune = pruneToolResults(this.sessionManager, settings);
+			// pruneToolResults false (per model): no prune, so the prompt is rewritten once per
+			// compaction instead of once per prune.
+			const prune =
+				settings.pruneToolResults === false ? { pruned: 0 } : pruneToolResults(this.sessionManager, settings);
 			if (prune.pruned > 0) {
 				this._refreshFinalizedContext();
 				const tokensAfterPrune = estimateProjectedContextTokens(

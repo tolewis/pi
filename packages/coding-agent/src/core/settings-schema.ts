@@ -16,6 +16,12 @@ const CompactionModelOverrideSchema = Type.Object({
 	provider: Type.Optional(Type.String()),
 	model: Type.Optional(Type.String()),
 	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
+	pruneToolResults: Type.Optional(
+		Type.Boolean({
+			description:
+				"False: compaction never prunes old tool results for this model and always summarizes. Each prune rewrites the prompt, so a server that keeps prompt states reads the whole prompt again. Unset means true.",
+		}),
+	),
 });
 
 const CompactionSettingsSchema = Type.Object({

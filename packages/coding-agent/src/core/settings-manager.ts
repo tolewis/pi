@@ -893,6 +893,19 @@ export class SettingsManager {
 		return value;
 	}
 
+	/** Whether compaction prunes old tool results for this model. Unset means true. */
+	getCompactionPruneToolResults(model?: Pick<Model<string>, "provider" | "id">): boolean | undefined {
+		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+		const entry = modelKey !== undefined ? this.settings.compaction?.modelOverrides?.[modelKey] : undefined;
+		const value = isMergeableObject(entry) ? entry.pruneToolResults : undefined;
+		if (value !== undefined && typeof value !== "boolean") {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"].pruneToolResults setting: ${String(value)}. Expected true or false.`,
+			);
+		}
+		return value;
+	}
+
 	/** Resolve a summarizer field through the model override, then the ordinary setting. Unset means inherit. */
 	private getCompactionSummarizerSetting<K extends "provider" | "model" | "thinkingLevel">(
 		field: K,
@@ -914,6 +927,7 @@ export class SettingsManager {
 		reserveTokens: number;
 		keepRecentTokens: number;
 		keepRecentToolResults?: number;
+		pruneToolResults?: boolean;
 		provider?: string;
 		model?: string;
 		thinkingLevel?: ThinkingLevel;
@@ -923,6 +937,7 @@ export class SettingsManager {
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
 			keepRecentToolResults: this.getCompactionKeepRecentToolResults(),
+			pruneToolResults: this.getCompactionPruneToolResults(model),
 			provider: this.getCompactionSummarizerSetting("provider", model),
 			model: this.getCompactionSummarizerSetting("model", model),
 			thinkingLevel: this.getCompactionSummarizerSetting("thinkingLevel", model),

@@ -11,6 +11,7 @@ import {
 	migrateSessionEntries,
 	type SessionEntry,
 } from "../../src/core/session-manager.ts";
+import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -129,6 +130,44 @@ describe("prune old tool results before compaction", () => {
 			.join("\n");
 		expect(texts).toContain("first task");
 		expect(texts).toContain("running the command");
+	});
+
+	it("does not prune and summarizes when the model sets pruneToolResults false", async () => {
+		const harness = await createHarness({
+			provider: "prune-off",
+			models: [{ id: "kept-prompt-states" }],
+			settings: {
+				compaction: {
+					keepRecentTokens: 100,
+					reserveTokens: 120_000,
+					modelOverrides: { "prune-off/kept-prompt-states": { pruneToolResults: false } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		// The same session that compacts by prune alone in the first test, with enough kept text
+		// that a summary has a cut point.
+		seedPrunableSession(harness, 40_000, 60_000);
+		harness.setResponses([fauxAssistantMessage("summary of the older turns")]);
+
+		await runAutoCompaction(harness, "threshold");
+
+		const compaction = latestCompaction(harness);
+		expect(compaction?.reason).toBe("threshold");
+		expect(compaction?.usage).toBeDefined();
+		expect(harness.getPendingResponseCount()).toBe(0);
+		// No stub was written: the summarizer read the full tool result.
+		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "context_edit")).toHaveLength(0);
+	});
+
+	it("reads pruneToolResults per model, unset elsewhere", () => {
+		const settings = SettingsManager.inMemory({
+			compaction: { modelOverrides: { "local/a": { pruneToolResults: false }, "local/b": {} } },
+		});
+		expect(settings.getCompactionPruneToolResults({ provider: "local", id: "a" })).toBe(false);
+		expect(settings.getCompactionPruneToolResults({ provider: "local", id: "b" })).toBeUndefined();
+		expect(settings.getCompactionPruneToolResults({ provider: "local", id: "c" })).toBeUndefined();
+		expect(settings.getCompactionSettings({ provider: "local", id: "a" }).pruneToolResults).toBe(false);
 	});
 
 	it("goes on to the summarizer when the context is still over the threshold after prune", async () => {
