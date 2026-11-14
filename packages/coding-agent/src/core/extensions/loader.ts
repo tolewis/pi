@@ -12,6 +12,7 @@ import { mcpNamespace } from "@earendil-works/pi-mcp";
 import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
+import { RESERVED_CUSTOM_TYPE_PREFIX } from "../compaction/failure.ts";
 import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
@@ -374,6 +375,11 @@ function createExtensionAPI(
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
 			assertActive();
+			if (customType.startsWith(RESERVED_CUSTOM_TYPE_PREFIX)) {
+				throw new Error(
+					`Entry renderer for "${customType}" registered by extension "${extension.path}" uses the reserved "${RESERVED_CUSTOM_TYPE_PREFIX}" prefix.`,
+				);
+			}
 			extension.entryRenderers ??= new Map();
 			extension.entryRenderers.set(customType, renderer as EntryRenderer);
 		},

@@ -175,6 +175,39 @@ describe("compaction model overrides", () => {
 		);
 	});
 
+	it("resolves summarizer provider, model, and thinking level: model override, then global, then inherit", () => {
+		const manager = SettingsManager.inMemory({
+			compaction: {
+				provider: "global-provider",
+				model: "global-model",
+				thinkingLevel: "low",
+				modelOverrides: { [modelKey]: { thinkingLevel: "off", model: "override-model" } },
+			},
+		});
+		expect(manager.getCompactionSettings(model)).toEqual({
+			...defaults,
+			provider: "global-provider",
+			model: "override-model",
+			thinkingLevel: "off",
+		});
+		expect(manager.getCompactionSettings({ provider: "other", id: "x" })).toEqual({
+			...defaults,
+			provider: "global-provider",
+			model: "global-model",
+			thinkingLevel: "low",
+		});
+		expect(manager.getCompactionSettings()).toMatchObject({ thinkingLevel: "low" });
+
+		const inherit = SettingsManager.inMemory({
+			compaction: { modelOverrides: { [modelKey]: { thinkingLevel: "high" } } },
+		});
+		expect(inherit.getCompactionSettings(model)).toEqual({ ...defaults, thinkingLevel: "high" });
+		const unset = inherit.getCompactionSettings({ provider: "other", id: "x" });
+		expect(unset.provider).toBeUndefined();
+		expect(unset.model).toBeUndefined();
+		expect(unset.thinkingLevel).toBeUndefined();
+	});
+
 	it("accepts zero in ordinary settings and model overrides", () => {
 		const manager = SettingsManager.inMemory({
 			compaction: { reserveTokens: 0, keepRecentTokens: 0 },

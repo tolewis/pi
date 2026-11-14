@@ -1,3 +1,7 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import type { FileEntry, SessionEntry, SessionMessageEntry } from "../../src/core/session-manager.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -178,5 +182,50 @@ describe("SessionManager.inMemory with preloaded entries", () => {
 		const restored = session.getEntries()[0] as SessionMessageEntry;
 
 		expect(restored.message.role).toBe("hookMessage");
+	});
+});
+
+describe("compaction entry reason and tokensAfter", () => {
+	it("loads entries with and without the optional fields and projects them the same", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-compaction-fields-"));
+		try {
+			const source = SessionManager.create(dir, dir);
+			source.appendMessage(userMessage("summarized"));
+			source.appendMessage(fauxAssistantMessage("answer"));
+			const keptId = source.appendMessage(userMessage("kept"));
+			source.appendCompaction("summary", keptId, 500, undefined, false, undefined, {
+				reason: "threshold",
+				tokensAfter: 120,
+			});
+			const sessionFile = source.getSessionFile();
+			if (!sessionFile) throw new Error("expected a session file");
+
+			// An older Pi wrote the same entry without the new fields.
+			const oldFile = join(dir, "old.jsonl");
+			const oldLines = readFileSync(sessionFile, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => {
+					const entry = JSON.parse(line) as Record<string, unknown>;
+					if (entry.type === "compaction") {
+						delete entry.reason;
+						delete entry.tokensAfter;
+					}
+					return JSON.stringify(entry);
+				});
+			writeFileSync(oldFile, `${oldLines.join("\n")}\n`);
+
+			const current = SessionManager.open(sessionFile);
+			const old = SessionManager.open(oldFile);
+			const currentCompaction = current.getEntries().find((entry) => entry.type === "compaction");
+			const oldCompaction = old.getEntries().find((entry) => entry.type === "compaction");
+
+			expect(currentCompaction).toMatchObject({ reason: "threshold", tokensAfter: 120 });
+			expect(oldCompaction).not.toHaveProperty("reason");
+			expect(oldCompaction).not.toHaveProperty("tokensAfter");
+			expect(old.buildSessionContext().messages).toEqual(current.buildSessionContext().messages);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

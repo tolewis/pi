@@ -10,6 +10,7 @@
 
 export const DEFAULT_MAX_LINES = 2000;
 export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+export const DEFAULT_MAX_RESULT_CHARS = 20_000; // Default per-result character budget
 export const GREP_MAX_LINE_LENGTH = 500; // Max chars per grep match line
 
 export interface TruncationResult {
@@ -299,4 +300,100 @@ function isHighSurrogate(code: number): boolean {
 
 function isLowSurrogate(code: number): boolean {
 	return code >= 0xdc00 && code <= 0xdfff;
+}
+
+export interface ResultCapOptions {
+	/** Maximum characters kept from the result. Default: 20,000. */
+	maxChars?: number;
+	/** Path of the full result, named in the marker so the model can read it. */
+	fullOutputPath?: string;
+}
+
+export interface ResultCapResult {
+	/** The capped text: the head, one marker line, and the tail. */
+	content: string;
+	truncated: boolean;
+	/** Bytes left out of the middle. */
+	omittedBytes: number;
+	maxChars: number;
+}
+
+export interface MiddleTruncationResult {
+	/** The start and end of the content with a `…N chars truncated…` marker between them. */
+	content: string;
+	truncated: boolean;
+	/** Characters left out. */
+	removedChars: number;
+	totalBytes: number;
+	totalLines: number;
+}
+
+/**
+ * One marker line for a result whose middle was left out: the omitted byte count and, when known,
+ * the path of the file that holds the full result.
+ */
+export function formatOmittedMarker(omittedBytes: number, fullOutputPath?: string): string {
+	const where = fullOutputPath ? `. Full output: ${fullOutputPath}` : "";
+	return `[... ${omittedBytes} bytes omitted${where} ...]`;
+}
+
+/**
+ * Cap a tool result to `maxChars` characters. Keeps the head and the tail, half of the budget each,
+ * and puts one marker line between them that gives the omitted byte count and the path of the full
+ * result. Cuts only at character boundaries, so a surrogate pair is never split.
+ *
+ * The marker adds a few dozen characters over the budget. That is deliberate: the marker is the
+ * only part of the result the model must read to find the rest.
+ */
+export function capResultChars(content: string, options: ResultCapOptions = {}): ResultCapResult {
+	const maxChars = options.maxChars ?? DEFAULT_MAX_RESULT_CHARS;
+	if (maxChars <= 0 || content.length <= maxChars) {
+		return { content, truncated: false, omittedBytes: 0, maxChars };
+	}
+
+	// Two newlines separate the head, the marker line, and the tail, so they come out of the budget.
+	const budget = Math.max(1, maxChars - 2);
+	const headChars = Math.ceil(budget / 2);
+	let headEnd = Math.min(headChars, content.length);
+	if (headEnd < content.length && isLowSurrogate(content.charCodeAt(headEnd))) {
+		headEnd--;
+	}
+	let tailStart = Math.max(headEnd, content.length - (budget - headChars));
+	if (tailStart > headEnd && isLowSurrogate(content.charCodeAt(tailStart))) {
+		tailStart++;
+	}
+
+	const head = content.slice(0, headEnd);
+	const tail = content.slice(tailStart);
+	const omittedBytes = Buffer.byteLength(content.slice(headEnd, tailStart), "utf-8");
+	const marker = formatOmittedMarker(omittedBytes, options.fullOutputPath);
+	return { content: `${head}\n${marker}\n${tail}`, truncated: true, omittedBytes, maxChars };
+}
+
+/**
+ * Keep the start and the end of `content`, half of `maxBytes` each, and replace the middle with a
+ * `…N chars truncated…` marker, like Codex does for tool output. Cuts only at character boundaries.
+ */
+export function truncateMiddle(content: string, maxBytes: number): MiddleTruncationResult {
+	const buf = Buffer.from(content, "utf-8");
+	const totalLines = splitLinesForCounting(content).length;
+	if (buf.length <= maxBytes) {
+		return { content, truncated: false, removedChars: 0, totalBytes: buf.length, totalLines };
+	}
+	// Continuation bytes (10xxxxxx) are not character starts.
+	const isBoundary = (index: number) => index >= buf.length || (buf[index] & 0xc0) !== 0x80;
+	let headEnd = Math.floor(maxBytes / 2);
+	while (headEnd > 0 && !isBoundary(headEnd)) headEnd--;
+	let tailStart = buf.length - (maxBytes - Math.floor(maxBytes / 2));
+	while (tailStart < buf.length && !isBoundary(tailStart)) tailStart++;
+	const head = buf.subarray(0, headEnd).toString("utf-8");
+	const tail = buf.subarray(tailStart).toString("utf-8");
+	const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString("utf-8")).length;
+	return {
+		content: `${head}…${removedChars} chars truncated…${tail}`,
+		truncated: true,
+		removedChars,
+		totalBytes: buf.length,
+		totalLines,
+	};
 }

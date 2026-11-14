@@ -1,6 +1,6 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import { createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -11,9 +11,11 @@ import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
+	generateSummaryWithUsage,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
+	validateCompactionResult,
 } from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
@@ -593,6 +595,146 @@ describe("Large session fixture", () => {
 
 		expect(loaded.messages.length).toBeGreaterThan(100);
 		expect(loaded.model).not.toBeNull();
+	});
+});
+
+describe("empty summary rejection", () => {
+	function replyWith(content: AssistantMessage["content"]): StreamFn {
+		return () => {
+			const stream = createAssistantMessageEventStream();
+			stream.end({ ...createAssistantMessage(""), content, stopReason: "stop" });
+			return stream;
+		};
+	}
+
+	function summarize(streamFn: StreamFn) {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const messages = [createUserMessage("Fix the parser")];
+		return generateSummaryWithUsage(
+			messages,
+			model,
+			undefined,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			streamFn,
+		);
+	}
+
+	it("rejects a thinking-only reply", async () => {
+		const streamFn = replyWith([{ type: "thinking", thinking: "The user wants a summary." }]);
+		await expect(summarize(streamFn)).rejects.toThrow("Summarization returned an empty summary");
+	});
+
+	it("rejects a whitespace-only reply", async () => {
+		const streamFn = replyWith([{ type: "text", text: "  \n\t " }]);
+		await expect(summarize(streamFn)).rejects.toThrow("Summarization returned an empty summary");
+	});
+
+	it("rejects an empty summary before compact() appends file lists", async () => {
+		const entries: SessionEntry[] = [];
+		for (let i = 0; i < 6; i++) {
+			entries.push(
+				createMessageEntry(
+					i % 2 === 0 ? createUserMessage(`request ${i} ${"x".repeat(400)}`) : createAssistantMessage("ok"),
+				),
+			);
+		}
+		const preparation = prepareCompaction(entries, { enabled: true, reserveTokens: 0, keepRecentTokens: 1 })!;
+		expect(preparation).toBeDefined();
+		preparation.fileOps.read.add("src/parser.ts");
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const streamFn = replyWith([{ type: "thinking", thinking: "..." }]);
+		await expect(
+			compact(preparation, model, "test-key", undefined, undefined, undefined, undefined, streamFn),
+		).rejects.toThrow("empty summary");
+	});
+});
+
+describe("summarization prompt goal rule", () => {
+	async function capturePrompt(previousSummary?: string): Promise<string> {
+		let prompt = "";
+		const streamFn: StreamFn = (_model, context) => {
+			const content = context.messages[context.messages.length - 1]?.content;
+			prompt = Array.isArray(content)
+				? content.map((block) => (block.type === "text" ? block.text : "")).join("")
+				: "";
+			const stream = createAssistantMessageEventStream();
+			stream.end(createAssistantMessage("## Goal\nsummary"));
+			return stream;
+		};
+		await generateSummaryWithUsage(
+			[createUserMessage("Fix the parser")],
+			getModel("anthropic", "claude-sonnet-4-5")!,
+			undefined,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			previousSummary,
+			undefined,
+			streamFn,
+		);
+		return prompt;
+	}
+
+	it("asks for the original request verbatim in the initial prompt", async () => {
+		const prompt = await capturePrompt();
+		expect(prompt).toContain('Original request: "[The first user message of the conversation, quoted verbatim.');
+		expect(prompt).toContain("at most 2,000 characters and mark a cut with [...]");
+		expect(prompt).toContain("Never paraphrase it.");
+		expect(prompt).toContain("Superseded by: <short text>");
+	});
+
+	it("keeps the original request quote verbatim in the update prompt", async () => {
+		const prompt = await capturePrompt('## Goal\nOriginal request: "Fix the parser"');
+		expect(prompt).toContain("Copy the original request quote from the previous summary verbatim.");
+		expect(prompt).toContain('KEEP the "Original request" quote under ## Goal verbatim.');
+		expect(prompt).toContain("Superseded by: <short text>");
+	});
+});
+
+describe("validateCompactionResult", () => {
+	const branchIds: ReadonlySet<string> = new Set(["a", "b"]);
+	const valid = { summary: "## Goal\nwork", firstKeptEntryId: "b", tokensBefore: 100 };
+
+	it("accepts a valid result", () => {
+		expect(validateCompactionResult(valid, branchIds)).toEqual({ ok: true });
+		expect(validateCompactionResult({ ...valid, tokensBefore: 0 }, branchIds)).toEqual({ ok: true });
+	});
+
+	it.each([
+		["empty", ""],
+		["whitespace", " \n\t"],
+		["not a string", 42],
+	])("rejects a summary that is %s", (_name, summary) => {
+		const result = validateCompactionResult({ ...valid, summary } as unknown as typeof valid, branchIds);
+		expect(result).toEqual({ ok: false, errorMessage: "Extension compaction result has an empty summary" });
+	});
+
+	it.each([
+		["off the branch", "c"],
+		["missing", undefined],
+		["null", null],
+	])("rejects a firstKeptEntryId that is %s", (_name, firstKeptEntryId) => {
+		const result = validateCompactionResult({ ...valid, firstKeptEntryId } as unknown as typeof valid, branchIds);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.errorMessage).toContain("is not on the current branch");
+	});
+
+	it.each([
+		["NaN", Number.NaN],
+		["Infinity", Number.POSITIVE_INFINITY],
+		["negative", -1],
+		["not a number", "100"],
+		["missing", undefined],
+	])("rejects tokensBefore that is %s", (_name, tokensBefore) => {
+		const result = validateCompactionResult({ ...valid, tokensBefore } as unknown as typeof valid, branchIds);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.errorMessage).toContain("is not a finite number >= 0");
 	});
 });
 

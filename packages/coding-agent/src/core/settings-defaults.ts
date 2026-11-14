@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/retry";
+import { DEFAULT_MAX_RESULT_CHARS } from "./tools/truncate.ts";
 
 /** Runtime defaults shared by settings accessors and the published JSON Schema. */
 export const SETTINGS_DEFAULTS = {
@@ -41,6 +42,9 @@ export const SETTINGS_DEFAULTS = {
 	images: {
 		autoResize: true,
 		blockImages: false,
+	},
+	tools: {
+		maxResultChars: DEFAULT_MAX_RESULT_CHARS,
 	},
 	doubleEscapeAction: "tree",
 	treeFilterMode: "default",

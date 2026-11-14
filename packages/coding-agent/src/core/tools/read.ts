@@ -1,25 +1,40 @@
 import type { ImageContent, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
 import { constants } from "fs";
-import { access as fsAccess, open as fsOpen, readFile as fsReadFile } from "fs/promises";
+import { access as fsAccess, open as fsOpen, readFile as fsReadFile, stat as fsStat } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { TextDecoder } from "util";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import { writeOutputFile } from "../../utils/output-files.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import {
+	capResultChars,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	DEFAULT_MAX_RESULT_CHARS,
+	formatSize,
+	type TruncationResult,
+	truncateHead,
+} from "./truncate.ts";
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	force: Type.Optional(
+		Type.Boolean({ description: "Read the text again even when the file is unchanged since the last read." }),
+	),
 });
 
 export const readToolSystemPromptContribution = {
 	snippet: "Read file contents",
-	guidelines: ["Use read to examine files instead of cat or sed."],
+	guidelines: [
+		"Use read to examine files instead of cat or sed.",
+		"A repeated read of a file that has not changed returns a short stub. Pass force: true to read the text again.",
+	],
 } as const;
 
 export type ReadToolInput = Static<typeof readSchema>;
@@ -63,6 +78,8 @@ export interface ReadOperations {
 	 * the signal aborts; the read tool also stops consuming the stream then.
 	 */
 	createReadStream?: (absolutePath: string, options: { signal?: AbortSignal }) => AsyncIterable<Uint8Array>;
+	/** File size and modification time, used to detect a repeated read. Without it, every read returns the text. */
+	stat?: (absolutePath: string) => Promise<{ mtimeMs: number; size: number }>;
 }
 
 const defaultReadOperations: ReadOperations = {
@@ -70,6 +87,7 @@ const defaultReadOperations: ReadOperations = {
 	createReadStream: readLocalFileChunks,
 	access: (path) => fsAccess(path, constants.R_OK),
 	detectImageMimeType: detectSupportedImageMimeTypeFromFile,
+	stat: (path) => fsStat(path),
 };
 
 /**
@@ -98,6 +116,33 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Model-facing character budget for one result. Default: 20,000. The full text stays in a temp file. */
+	maxResultChars?: number;
+}
+
+/** The last read of one path, used to answer a repeated read with a stub instead of the text. */
+interface LastRead {
+	mtimeMs: number;
+	size: number;
+	lineCount: number;
+	turn: number;
+	offset: number | undefined;
+	limit: number | undefined;
+}
+
+/** The turn number: the count of user messages on the session branch. Zero without a session. */
+function currentTurn(ctx: ExtensionContext | undefined): number {
+	let turn = 0;
+	for (const entry of ctx?.sessionManager?.getBranch() ?? []) {
+		if (entry.type === "message" && entry.message.role === "user") {
+			turn++;
+		}
+	}
+	return turn;
+}
+
+function repeatedReadStub(lastRead: LastRead): string {
+	return `Unchanged since the last read (turn ${lastRead.turn}): ${lastRead.lineCount} lines.\nPass force: true to read the text again.`;
 }
 
 /** The image block and its note, or the text for text files and images that could not be processed. */
@@ -232,11 +277,14 @@ export function createReadToolDefinition(
 ): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const fallbackResizeOptions = options?.resizeOptions;
+	const maxResultChars = options?.maxResultChars;
 	const ops = options?.operations ?? defaultReadOperations;
+	// One entry per path, for the lifetime of this tool definition, which is the session.
+	const lastReads = new Map<string, LastRead>();
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) and capped at ${maxResultChars ?? DEFAULT_MAX_RESULT_CHARS} characters. Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		promptSnippet: readToolSystemPromptContribution.snippet,
 		promptGuidelines: [...readToolSystemPromptContribution.guidelines],
 		parameters: readSchema,
@@ -244,7 +292,7 @@ export function createReadToolDefinition(
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
 			_toolCallId,
-			{ path, offset, limit }: { path: string; offset?: number; limit?: number },
+			{ path, offset, limit, force }: { path: string; offset?: number; limit?: number; force?: boolean },
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?: ExtensionContext,
@@ -270,6 +318,16 @@ export function createReadToolDefinition(
 							await ops.access(absolutePath);
 							if (aborted) return;
 							const mimeType = ops.detectImageMimeType ? await ops.detectImageMimeType(absolutePath) : undefined;
+							const previousStats = mimeType || !ops.stat ? undefined : await ops.stat(absolutePath);
+							const previousRead = lastReads.get(absolutePath);
+							const repeated =
+								!force &&
+								previousRead !== undefined &&
+								previousStats !== undefined &&
+								previousRead.mtimeMs === previousStats.mtimeMs &&
+								previousRead.size === previousStats.size &&
+								previousRead.offset === offset &&
+								previousRead.limit === limit;
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
 							if (mimeType) {
@@ -293,6 +351,9 @@ export function createReadToolDefinition(
 										details = { imageUnsupportedByModel: ctx.model.id };
 									}
 								}
+							} else if (repeated && previousRead) {
+								// The file is unchanged since the last read of the same range: give the fact, not the bytes.
+								content = [{ type: "text", text: repeatedReadStub(previousRead) }];
 							} else {
 								// Read text content. Convert offset from 1-indexed input to 0-indexed line access.
 								const startLine = offset ? Math.max(0, offset - 1) : 0;
@@ -340,7 +401,25 @@ export function createReadToolDefinition(
 									// No truncation and no remaining user-limited content.
 									outputText = truncation.content;
 								}
+								if (maxResultChars !== undefined && outputText.length > maxResultChars) {
+									// Keep the head and the tail, and put the full text of this read in a temp file.
+									const fullOutputPath = await writeOutputFile("pi-read", ".txt", selectedContent);
+									outputText = capResultChars(outputText, {
+										maxChars: maxResultChars,
+										fullOutputPath,
+									}).content;
+								}
 								content = [{ type: "text", text: outputText }];
+								if (previousStats) {
+									lastReads.set(absolutePath, {
+										mtimeMs: previousStats.mtimeMs,
+										size: previousStats.size,
+										lineCount: totalFileLines,
+										turn: currentTurn(ctx),
+										offset,
+										limit,
+									});
+								}
 							}
 
 							if (aborted) return;

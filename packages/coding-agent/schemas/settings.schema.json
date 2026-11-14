@@ -109,6 +109,15 @@
     "compaction": {
       "type": "object",
       "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "thinkingLevel": {
+          "$ref": "#/$defs/ModelThinkingLevel"
+        },
         "enabled": {
           "type": "boolean",
           "default": true
@@ -125,6 +134,12 @@
           "maximum": 9007199254740991,
           "default": 20000
         },
+        "keepRecentToolResults": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Newest turns whose tool results stay in full when a compaction prunes older results. Unset prunes the results outside the kept tail."
+        },
         "modelOverrides": {
           "type": "object",
           "patternProperties": {
@@ -140,6 +155,19 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "thinkingLevel": {
+                  "$ref": "#/$defs/ModelThinkingLevel"
+                },
+                "pruneToolResults": {
+                  "type": "boolean",
+                  "description": "False: compaction never prunes old tool results for this model and always summarizes. Each prune rewrites the prompt, so a server that keeps prompt states reads the whole prompt again. Unset means true."
                 }
               }
             }
@@ -151,6 +179,15 @@
     "branchSummary": {
       "type": "object",
       "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "thinkingLevel": {
+          "$ref": "#/$defs/ModelThinkingLevel"
+        },
         "reserveTokens": {
           "type": "number",
           "description": "Tokens reserved for the prompt and LLM response.",
@@ -497,6 +534,18 @@
         "type": "string"
       },
       "description": "Initial tool selection. Plain names replace the inherited selection; +name and -name entries add or remove tools."
+    },
+    "tools": {
+      "type": "object",
+      "properties": {
+        "maxResultChars": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 20000,
+          "description": "Maximum characters of one tool result that reach the model. The head and the tail are kept, with one marker line that gives the omitted byte count and the temp file holding the full output."
+        }
+      }
     },
     "doubleEscapeAction": {
       "anyOf": [

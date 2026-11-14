@@ -2,7 +2,7 @@ import { type Static, type TSchemaOptions, Type } from "typebox";
 import { ModelThinkingLevelSchema } from "./pi-ai-schemas.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 
-function nonNegativeSafeInteger(options: { default?: number } = {}) {
+function nonNegativeSafeInteger(options: { default?: number } & TSchemaOptions = {}) {
 	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
@@ -13,12 +13,30 @@ function timeoutSetting(options?: TSchemaOptions) {
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
+	pruneToolResults: Type.Optional(
+		Type.Boolean({
+			description:
+				"False: compaction never prunes old tool results for this model and always summarizes. Each prune rewrites the prompt, so a server that keeps prompt states reads the whole prompt again. Unset means true.",
+		}),
+	),
 });
 
 const CompactionSettingsSchema = Type.Object({
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	keepRecentToolResults: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Newest turns whose tool results stay in full when a compaction prunes older results. Unset prunes the results outside the kept tail.",
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
@@ -27,6 +45,9 @@ const CompactionSettingsSchema = Type.Object({
 });
 
 const BranchSummarySettingsSchema = Type.Object({
+	provider: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
 	reserveTokens: Type.Optional(
 		Type.Number({
 			description: "Tokens reserved for the prompt and LLM response.",
@@ -101,6 +122,16 @@ const TerminalSettingsSchema = Type.Object({
 		Type.Union([Type.Literal("kitty"), Type.Literal("iterm2"), Type.Literal("auto"), Type.Literal(false)]),
 	),
 	trueColor: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("auto")])),
+});
+
+const ToolsSettingsSchema = Type.Object({
+	maxResultChars: Type.Optional(
+		nonNegativeSafeInteger({
+			default: SETTINGS_DEFAULTS.tools.maxResultChars,
+			description:
+				"Maximum characters of one tool result that reach the model. The head and the tail are kept, with one marker line that gives the omitted byte count and the temp file holding the full output.",
+		}),
+	),
 });
 
 const ImageSettingsSchema = Type.Object({
@@ -348,6 +379,7 @@ export const SettingsSchema = Type.Object(
 					"Initial tool selection. Plain names replace the inherited selection; +name and -name entries add or remove tools.",
 			}),
 		),
+		tools: Type.Optional(ToolsSettingsSchema),
 		doubleEscapeAction: Type.Optional(
 			Type.Union([Type.Literal("fork"), Type.Literal("tree"), Type.Literal("none")], {
 				description: "Action for double-escape with an empty editor.",
@@ -474,6 +506,7 @@ export interface ProviderRetrySettings extends Static<typeof ProviderRetrySettin
 export interface RetrySettings extends Omit<Static<typeof RetrySettingsSchema>, "maxDelayMs"> {}
 export interface TerminalSettings extends Static<typeof TerminalSettingsSchema> {}
 export interface ImageSettings extends Static<typeof ImageSettingsSchema> {}
+export interface ToolsSettings extends Static<typeof ToolsSettingsSchema> {}
 export interface ThinkingBudgetsSettings extends Static<typeof ThinkingBudgetsSettingsSchema> {}
 export type MermaidRenderingMode = NonNullable<Static<typeof MarkdownSettingsSchema>["mermaid"]>;
 export interface MarkdownSettings extends Static<typeof MarkdownSettingsSchema> {}

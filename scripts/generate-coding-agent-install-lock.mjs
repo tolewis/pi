@@ -274,7 +274,7 @@ function createRootLockEntry(installerPackageJson) {
 	return sortedPackageEntry(entry);
 }
 
-function validateGeneratedFiles(installerPackageJson, installLock, internalNames) {
+function validateGeneratedFiles(installerPackageJson, installLock, internalNames, expectedInternalVersions) {
 	const errors = [];
 	const rootEntry = installLock.packages[""];
 	const includedPackageNames = new Set();
@@ -309,12 +309,13 @@ function validateGeneratedFiles(installerPackageJson, installLock, internalNames
 		if (entry.dev || entry.devOptional || entry.extraneous) {
 			errors.push(`${lockPath || "root"} contains dev/extraneous metadata`);
 		}
+		const expectedInternalVersion = expectedInternalVersions.get(packageName) ?? installerPackageJson.version;
 		if (
 			packageName !== undefined &&
 			(packageName.startsWith(internalPackagePrefix) || internalPackageNames.has(packageName)) &&
-			entry.version !== installerPackageJson.version
+			entry.version !== expectedInternalVersion
 		) {
-			errors.push(`${lockPath} internal package version ${entry.version} does not match ${installerPackageJson.version}`);
+			errors.push(`${lockPath} internal package version ${entry.version} does not match ${expectedInternalVersion}`);
 		}
 		if (entry.hasInstallScript) {
 			if (!packageName || !entry.version) {
@@ -415,7 +416,18 @@ function generateInstallLock() {
 		packages: sortedObject(installLockPackages),
 	};
 
-	validateGeneratedFiles(installerPackageJson, installLock, internalNames);
+	// An internal package must match the exact version that the coding agent, or another internal
+	// package, declares for it. Upstream releases in lockstep, so that equals the coding agent
+	// version. A fork build may ship a pre-release coding agent over the published packages.
+	const expectedInternalVersions = new Map();
+	const addDeclaredVersions = (dependencies) => {
+		for (const [name, spec] of Object.entries(dependencies ?? {})) {
+			if (/^\d/.test(spec) && !expectedInternalVersions.has(name)) expectedInternalVersions.set(name, spec);
+		}
+	};
+	addDeclaredVersions(codingAgentPackage.dependencies);
+	for (const workspace of internalWorkspaces.values()) addDeclaredVersions(workspace.packageJson.dependencies);
+	validateGeneratedFiles(installerPackageJson, installLock, internalNames, expectedInternalVersions);
 	return { installerPackageJson, installLock };
 }
 
