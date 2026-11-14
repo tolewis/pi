@@ -403,7 +403,7 @@ export function createReadToolDefinition(
 								}
 								if (maxResultChars !== undefined && outputText.length > maxResultChars) {
 									// Keep the head and the tail, and put the full text of this read in a temp file.
-									const fullOutputPath = await writeOutputFile("pi-read", ".txt", selectedContent);
+									const fullOutputPath = await writeOutputFile("pi-read", ".txt", outputText);
 									outputText = capResultChars(outputText, {
 										maxChars: maxResultChars,
 										fullOutputPath,
