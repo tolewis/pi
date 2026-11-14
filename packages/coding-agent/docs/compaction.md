@@ -40,6 +40,12 @@ A provider context-overflow error or an early final `stopReason: "length"` can s
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
+### Pruning old tool results
+
+Before an automatic compaction summarizes, Pi replaces tool results older than the kept tail with a one-line stub through a `context_edit` entry. The stub names the tool, the byte count, and the turn. The summarizer then reads the stubs instead of the full output. When the stubs alone bring the projected context under the threshold, Pi skips the summarizer and writes a compaction entry with `reason: "prune"` and `tokensAfter`. The conversation text stays in context. Only tool output is replaced, so a file read or a command can be repeated when its output is needed again.
+
+`compaction.keepRecentToolResults` sets how many of the newest turns keep their tool results in full. Unset, the kept tail of `keepRecentTokens` decides. A result whose stub would be longer than the result is left alone. Manual `/compact` does not prune.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards through the finalized session projection, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
@@ -137,6 +143,44 @@ Never cut at tool results (they must stay with their tool call).
 
 Preparation advances the kept boundary into a context-invisible suffix only when that suffix contains an omitted assistant attempt and no unomitted context-producing entries. Recovery `context_edit` omissions satisfy this rule; intrinsically context-invisible metadata may coexist with them. Metadata alone and newly appended custom messages do not move the cut. A replacement edit affecting the candidate input or summarized prefix also blocks advancement because the omitted assistant answered the pre-edit input; replacements of suffix entries that are ultimately omitted remain safe. This allows an over-budget recovered input to be summarized while retaining the edits that keep the abandoned attempt omitted, without making bookkeeping change whether new model input is preserved verbatim.
 
+### Failure Records
+
+Pi appends a `pi:compaction_failure` custom entry to the session when a compaction does not complete. The entry does not enter model context. The format is in [session-format.md](session-format.md#compaction-failure-record).
+
+Pi writes a record in these cases:
+
+| Case | `outcome` | `reason` |
+|---|---|---|
+| The summarizer or a `session_before_compact` handler throws | `error` | `summarizer_error` |
+| The user or an extension cancels the compaction | `cancelled` | `cancelled` |
+| Auto-compaction is over the threshold, but `keepRecentTokens` keeps all context since the last compaction | `skipped` | `kept_window_exceeds_threshold` |
+| Auto-compaction is over the threshold, but nothing else can be summarized | `skipped` | `nothing_to_summarize` |
+| The retry after one overflow recovery fails again | `error` | `overflow_recovery_exhausted` |
+
+Manual `/compact` failures also get a record with `trigger: "manual"`. Pi still emits `compaction_end` with `errorMessage` and `session_compact_failed` as before.
+
+Pi checks the threshold at several points per turn. To keep one failure from writing many records, Pi skips a record in two cases:
+- `error`, `cancelled`, and `timeout`: the newest entry on the branch is already a failure record with the same `outcome` and `reason`.
+- `skipped` and `fallback`: a failure record with the same `outcome` and `reason` exists after the last compaction and the last user message.
+
+A user message or a successful compaction starts a new episode, so the next failure writes a new record.
+
+Where the record shows:
+- Interactive mode shows one line, `compaction failed (<reason>): <errorMessage>`, with the token count and threshold when present. The line is an entry, so it stays after a re-render or a resume.
+- `--mode json` and `--mode rpc` write the same line to stderr with the prefix `[pi]`. The `entry_appended` event on stdout carries the entry.
+- `--export` HTML keeps the entry in the embedded session data and does not render it.
+
+### Threshold Back-off
+
+Failure records also limit retries of threshold auto-compaction. Pi counts the `error` and `timeout` records after the last compaction and the last user message. Skipped and cancelled records do not count.
+
+- After a failure, pi retries only when the context grows by `max(8192, 5% of the context window)` tokens past the `tokensBefore` of the newest failure.
+- After 3 consecutive failures, threshold auto-compaction pauses. The footer shows `auto-compaction paused (3 failures)`.
+- A user message or a successful compaction, for example `/compact`, resets the count.
+- Overflow recovery and manual compaction do not use this back-off.
+
+Pi derives the back-off from the session file only. A resumed session keeps the same state.
+
 ### CompactionEntry Structure
 
 Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):
@@ -153,6 +197,9 @@ interface CompactionEntry<T = unknown> {
   usage?: Usage;       // LLM usage that generated the summary
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
+  systemMessage?: SystemMessage; // prompt and tool state at the compaction boundary
+  reason?: "manual" | "threshold" | "overflow" | "extension" | "prune"; // what started the compaction
+  tokensAfter?: number; // estimated context right after the compaction (chars/4)
 }
 
 // Default compaction uses this for details (from compaction.ts):
@@ -161,6 +208,8 @@ interface CompactionDetails {
   modifiedFiles: string[];
 }
 ```
+
+`reason` and `tokensAfter` are absent on entries written by older Pi versions. `reason: "extension"` marks a compaction draft from a `turn_end` or `agent_before_settle` handler. `ctx.compact()` records `"manual"`, the same reason its events carry. `tokensAfter` is an estimate, not a provider count.
 
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 
@@ -239,6 +288,7 @@ Compaction summaries use this format:
 
 ```markdown
 ## Goal
+Original request: "[First user message, verbatim]"
 [What the user is trying to accomplish]
 
 ## Constraints & Preferences
@@ -272,6 +322,8 @@ path/to/file2.ts
 path/to/changed.ts
 </modified-files>
 ```
+
+The Goal section starts with the original request. The summarizer quotes the first user message of the session verbatim, at most 2,000 characters, and marks a cut with `[...]`. Each later compaction copies the quote from the previous summary without change. If the goal changed later in the session, the summarizer adds one `Superseded by: <short text>` line after the quote. This keeps the user's exact words across many compactions, where repeated paraphrase would drift. The rule is in the prompt only. Pi does not check that the model follows it.
 
 ### Message Serialization
 
@@ -330,6 +382,14 @@ pi.on("session_before_compact", async (event, ctx) => {
   };
 });
 ```
+
+Pi validates a custom result before it saves it:
+
+- `summary` must be a string that is not empty after trim.
+- `firstKeptEntryId` must be the id of an entry on the current branch.
+- `tokensBefore` must be a finite number that is 0 or more.
+
+If a check fails, Pi does not save the result. It reports an extension error for `session_before_compact` with the reason, and then runs the default compaction, the same as when a handler throws. The error shows the path `<compaction>`, not the path of the extension, because Pi combines the handler results before it checks them. Pi also checks `compaction` drafts that `turn_end` and `agent_before_settle` handlers return. A `null` `firstKeptEntryId` is valid there. Pi drops an invalid draft, applies the other drafts, and reports an extension error for that event. There is no default compaction on this path. In both cases Pi also appends a `pi:compaction_failure` entry with `reason: "invalid_extension_result"` and `fromExtension: true`. A default summary with no text produces a failure entry with `reason: "empty_summary"`. Pi also rejects a default summary that has no text, for example a reply with only thinking blocks. That compaction fails and saves nothing.
 
 #### Converting Messages to Text
 
@@ -416,6 +476,8 @@ See `SessionBeforeTreeEvent` and `TreePreparation` in the types file.
 
 ## Settings
 
+See [Settings: Compaction](settings.md#compaction) and [Settings: Branch summaries](settings.md#branch-summaries) for summary model and thinking-level options.
+
 Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`:
 
 ```json
@@ -461,3 +523,21 @@ Keys are exact, case-sensitive `provider/modelId` values, including any slashes 
 These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
 
 Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [Settings](settings.md#per-model-compaction-overrides) for details.
+
+### Compaction model
+
+`compaction.provider`, `compaction.model`, and `compaction.thinkingLevel` select the summarizer. A model override for the session model can set the same three fields. Each field resolves from the model override, then `compaction.*`, then the session model and thinking level. See [Settings: Compaction](settings.md#compaction).
+
+If the configured model is not in the model registry or has no auth, compaction fails with `Compaction model <provider/id> is not available: <why>`. Pi does not fall back to the session model in this case. Automatic compaction reports the error through `compaction_end` and leaves the context unchanged.
+
+#### Window-fit guard
+
+A compaction model with a smaller context window must never receive an input that cannot fit. This check runs only when the compaction model differs from the session model:
+
+1. Pi estimates the summarizer input with the chars/4 heuristic. The input is the history to summarize, the split-turn prefix, and the previous summary.
+2. Pi adds `SUMMARY_OUTPUT_ALLOWANCE_TOKENS` (8192) for the summary output.
+3. If the sum is greater than the compaction model's `contextWindow`, Pi summarizes with the session model instead.
+
+The fallback writes a compaction failure record with `outcome: "fallback"` and `reason: "compaction_model_window"`. The record names the compaction model, its window, and the comparison, for example `250000 + 8192 > 131072`. The compaction itself succeeds. To use the smaller model reliably, increase `compaction.reserveTokens` so that compaction starts earlier.
+
+Branch summaries do not need this guard. `generateBranchSummary` selects history to fit the window of the branch-summary model.
